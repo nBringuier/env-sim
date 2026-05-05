@@ -1,0 +1,29 @@
+{
+  "name": "EnvSim Dev Container",
+  "build": {
+    "dockerfile": "Containerfile",
+    "context": "."
+  },
+
+  // Dossier ouvert par défaut dans le conteneur
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+
+  // Utilisateur par défaut (doit correspondre à celui créé dans le Containerfile)
+  "remoteUser": "user",
+
+  "forwardPorts": [
+    4200,
+    8080
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "vscjava.vscode-java-debug",
+        "redhat.java",
+        "redhat.vscode-quarkus",
+        "vscjava.vscode-java-test",
+        "Angular.ng-template"
+      ]
+    }
+  }
+}

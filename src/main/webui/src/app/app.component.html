@@ -1,0 +1,89 @@
+<div class="app-shell">
+  <header class="app-header">
+    <h1>{{ title }}</h1>
+  </header>
+
+  <section class="controls-section">
+    <div class="control-group">
+      <h3>Simulation Control</h3>
+      <div class="button-row">
+        <button type="button" class="btn-primary" (click)="start()" [disabled]="isRunning">▶️ Start</button>
+        <button type="button" class="btn-danger" (click)="stop()">⏹️ Stop</button>
+        <button type="button" class="btn-warning" (click)="pause()" [disabled]="!isRunning">⏸️ Pause</button>
+        <button type="button" class="btn-success" (click)="resume()" [disabled]="!isRunning">▶️ Resume</button>
+      </div>
+    </div>
+
+    <div class="control-group">
+      <h3>Speed Control</h3>
+      <div class="button-row">
+        <button type="button" class="btn-secondary" (click)="setTimeScale(0.5)" [class.active]="timeScale === 0.5">0.5x</button>
+        <button type="button" class="btn-secondary" (click)="setTimeScale(1)" [class.active]="timeScale === 1">1x</button>
+        <button type="button" class="btn-secondary" (click)="setTimeScale(2)" [class.active]="timeScale === 2">2x</button>
+        <button type="button" class="btn-secondary" (click)="setTimeScale(10)" [class.active]="timeScale === 10">10x</button>
+        <button type="button" class="btn-secondary" (click)="setTimeScale(100)" [class.active]="timeScale === 100">100x</button>
+      </div>
+    </div>
+
+    <div class="control-group">
+      <h3>Time Jump</h3>
+      <div class="button-row">
+        <button type="button" class="btn-info" (click)="jump(1000)">⏭️ 1sec</button>
+        <button type="button" class="btn-info" (click)="jump(10000)">⏭️ 10sec</button>
+        <button type="button" class="btn-info" (click)="jump(60000)">⏭️ 1min</button>
+      </div>
+    </div>
+
+    <div class="control-group">
+      <h3>Scenario Management</h3>
+      <div class="button-row">
+        <button type="button" class="btn-outline" (click)="generateScenario()">🔄 Generate</button>
+        <button type="button" class="btn-outline" (click)="loadScenario()">📥 Get</button>
+        <button type="button" class="btn-outline" (click)="postScenario()">📤 Post</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="status-section">
+    <div class="status-panel">
+      <div class="status-item">
+        <span class="label">Status:</span>
+        <span class="value" [class.running]="isRunning" [class.stopped]="!isRunning">
+          {{ isRunning ? (isPaused ? 'Paused' : 'Running') : 'Stopped' }}
+        </span>
+      </div>
+      <div class="status-item">
+        <span class="label">Simulation Time:</span>
+        <span class="value">{{ simuTime }}ms</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Speed:</span>
+        <span class="value">{{ timeScale }}x</span>
+      </div>
+    </div>
+    <div class="message-bar" *ngIf="statusMessage">
+      <span>{{ statusMessage }}</span>
+      <button type="button" class="close-btn" (click)="statusMessage = ''">✕</button>
+    </div>
+  </section>
+
+  <section class="editor-section">
+    <div class="editor-container">
+      <label for="scenario-editor">Scenario JSON Editor</label>
+      <textarea
+        id="scenario-editor"
+        #scenarioEditor
+        [value]="scenarioJson"
+        (input)="scenarioJson = scenarioEditor.value"
+        rows="25"
+        cols="100"
+        spellcheck="false"
+        placeholder="Load or paste scenario JSON here..."
+      ></textarea>
+      <div class="editor-error" *ngIf="editorError">
+        <span class="error-icon">⚠️</span>
+        {{ editorError }}
+      </div>
+    </div>
+  </section>
+</div>

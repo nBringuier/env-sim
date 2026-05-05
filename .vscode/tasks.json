@@ -1,0 +1,31 @@
+{
+    // See https://go.microsoft.com/fwlink/?LinkId=733558
+    // for the documentation about the tasks.json format
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build container image",
+            "type": "shell",
+            "command": "docker build ${workspaceFolder}/.devcontainer/ -f ${workspaceFolder}/.devcontainer/Containerfile -t dev/quarkus && docker system prune -f",
+            "group": "build"
+        },
+        {
+            "label": "Run Quarkus app",
+            "type": "shell",
+            "command": "mvn quarkus:dev",
+            "group": "build"
+        },
+        {
+            "label": "Build jar",
+            "type": "shell",
+            "command": "mvn clean package",
+            "group": "build"
+        },
+        {
+            "label": "Build native",
+            "type": "shell",
+            "command": "mvn clean package -Pnative",
+            "group": "build"
+        }
+    ]
+}

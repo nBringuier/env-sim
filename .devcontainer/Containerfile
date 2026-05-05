@@ -1,0 +1,17 @@
+# FROM oraclelinux:9-slim
+FROM ghcr.io/graalvm/native-image-community:25-ol9
+
+RUN microdnf module enable maven:3.9 nodejs:22 
+RUN microdnf install git unzip maven nodejs npm
+RUN useradd --create-home --shell /bin/bash user
+RUN microdnf clean all
+
+USER user
+RUN mkdir ~/.npm
+RUN npm config set prefix '~/.npm'
+RUN echo 'export PATH="$HOME/.npm/bin:$PATH"' >> ~/.bashrc
+RUN npm install -g @angular/cli@19
+
+WORKDIR /home/user
+
+CMD ["bash"]
