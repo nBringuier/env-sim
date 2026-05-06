@@ -111,6 +111,62 @@ export class AppComponent implements OnInit, OnDestroy {
     }
   }
 
+  saveScenarioAsFile() {
+    if (!this.scenarioJson.trim()) {
+      this.statusMessage = 'No scenario content to save';
+      return;
+    }
+
+    try {
+      // Validate JSON before saving
+      JSON.parse(this.scenarioJson);
+
+      const blob = new Blob([this.scenarioJson], { type: 'application/json' });
+      const url = window.URL.createObjectURL(blob);
+
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `scenario-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+      window.URL.revokeObjectURL(url);
+      this.statusMessage = 'Scenario saved as JSON file';
+    } catch (error: any) {
+      this.editorError = 'Cannot save invalid JSON: ' + error.message;
+    }
+  }
+
+  loadScenarioFromFile() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,application/json';
+
+    input.onchange = (event: any) => {
+      const file = event.target.files[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = (e: any) => {
+          try {
+            const content = e.target.result;
+            // Validate JSON
+            JSON.parse(content);
+            this.scenarioJson = content;
+            this.editorError = '';
+            this.statusMessage = `Scenario loaded from "${file.name}"`;
+          } catch (error: any) {
+            this.editorError = 'Invalid JSON file: ' + error.message;
+          }
+        };
+        reader.readAsText(file);
+      }
+    };
+
+    input.click();
+  }
+
+
   async setTimeScale(scale: number) {
     await this.callApiAction(() => this.appService.setTimeScale(scale), `Time scale set to ${scale}x`);
   }
