@@ -19,6 +19,7 @@ A real-time, web-based discrete event simulator built with **Java/Quarkus** back
 - Clone scenarios for parallel execution
 - Backup/restore snapshots
 - Load/edit scenarios via JSON editor
+- **File save/load**: Save scenarios as JSON files, load from local files
 - Unique ID-based object lookup
 
 ✅ **Real-Time Monitoring**
@@ -84,10 +85,7 @@ mvn quarkus:dev
 | `POST` | `/api/engine/runUntil?time=X` | Fast-forward to time |
 | `GET` | `/api/engine/scenario` | Get current scenario |
 | `POST` | `/api/engine/scenario` | Set new scenario (JSON) |
-| `POST` | `/api/engine/backup` | Create scenario backup |
-| `GET` | `/api/engine/backup` | Get backed-up scenario |
-| `POST` | `/api/engine/restore` | Restore from backup |
-| `GET` | `/api/engine/reset` | Reset engine |
+| `POST` | `/api/engine/generate-scenario` | Generate sample scenario |
 | `WS` | `/ws/engine` | WebSocket live updates |
 
 ### Usage Example
@@ -97,7 +95,8 @@ mvn quarkus:dev
 
 2. **Create Scenario**
    - Click "Generate Scenario"
-   - Optional : manually edit JSON in editor and click "Post Scenario" to load
+   - Optional: manually edit JSON in editor and click "Post Scenario" to load
+   - **File Operations**: Save current scenario as JSON file, or load scenario from local JSON file
 
 3. **Run Simulation**
    - Click "Start"
@@ -107,11 +106,6 @@ mvn quarkus:dev
 4. **Monitor Live**
    - Status updates in real-time via WebSocket
    - View simulation time, speed, and state
-
-5. **Backup & Restore**
-   - Click "Create Backup" to snapshot current scenario
-   - Click "Stop" (auto-backup)
-   - Click "Restore Backup" to reload
 
 ### Architecture
 
@@ -123,6 +117,11 @@ while running:
   - Advance simuTime
   - Sleep based on timeScale (or fast-forward)
 ```
+
+**Automatic Scenario Backup**
+- Original scenario automatically saved as JSON string at simulation start
+- Scenario restored from backup on simulation stop
+- No manual backup/restore operations needed
 
 **Scenario Hierarchy**
 ```
@@ -185,7 +184,8 @@ public class MyObject extends ActiveObject {
 ### Future Enhancements
 
 - Multiple parallel engine instances
-- Scenario versioning & history
-- Data export (CSV, charts)
+- Enhanced file operations (batch import/export, scenario templates)
+- Data export (CSV, charts, simulation logs)
 - Performance profiling
 - Custom event types
+- Scenario validation and schema support
