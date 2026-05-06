@@ -4,6 +4,7 @@ import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import exemple.model.Scenario;
 import exemple.model.EngineStatus;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -19,6 +20,8 @@ public class Engine {
     private volatile boolean paused = false;
     private double timeScale = 1.0; // 1.0 = real time, 0.5 = half speed, 2.0 = double speed
     private long runUntilTime = -1; // -1 = disabled, otherwise run as fast as possible until this time
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     // State listeners
     private final List<Consumer<EngineStatus>> stateListeners = Collections.synchronizedList(new ArrayList<>());
@@ -174,6 +177,14 @@ public class Engine {
      * Internal method that runs the simulation (executed in executor thread)
      */
     private void runSimulation() {
+        // Store original scenario as JSON string for restoration
+        String originalScenarioJson = null;
+        try {
+            originalScenarioJson = objectMapper.writeValueAsString(scenario);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialize original scenario", e);
+        }
+
         try {
             isRunning = true;
             notifyStateChange();
@@ -241,7 +252,14 @@ public class Engine {
             paused = false;
             runUntilTime = -1;
             eventQueue.clear();
+            // Restore scenario from JSON backup
+            try {
+                this.scenario = objectMapper.readValue(originalScenarioJson, Scenario.class);
+            } catch (Exception e) {
+                // If restoration fails, set to null to indicate error state
+                this.scenario = null;
+            }
             notifyStateChange();
         }
-    }    
+    }
 }
