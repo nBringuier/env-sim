@@ -5,6 +5,13 @@ import { AppService, EngineStatus } from '../services/app.service';
 import { StringUtils } from '../utils/StringUtils';
 import { Subscription } from 'rxjs';
 
+interface TreeNode {
+  name: string;
+  type: string;
+  children?: TreeNode[];
+  expanded?: boolean;
+}
+
 @Component({
   selector: 'app-root',
   imports: [CommonModule],
@@ -22,6 +29,9 @@ export class AppComponent implements OnInit, OnDestroy {
   simuTime = 0;
   timeScale = 1.0;
   isPaused = false;
+
+  // Tree view properties
+  scenarioTree: TreeNode[] = [];
 
   private readonly titleService = inject(Title);
   private readonly appService = inject(AppService);
@@ -84,6 +94,7 @@ export class AppComponent implements OnInit, OnDestroy {
     if (result !== undefined) {
       this.scenarioJson = JSON.stringify(result, null, 2);
       this.statusMessage = 'Scenario generated successfully';
+      this.updateTreeView();
     }
   }
 
@@ -92,6 +103,7 @@ export class AppComponent implements OnInit, OnDestroy {
     if (result !== undefined) {
       this.scenarioJson = JSON.stringify(result, null, 2);
       this.statusMessage = 'Scenario loaded successfully';
+      this.updateTreeView();
     }
   }
 
@@ -108,6 +120,7 @@ export class AppComponent implements OnInit, OnDestroy {
     if (result !== undefined) {
       this.scenarioJson = JSON.stringify(result, null, 2);
       this.statusMessage = 'Scenario posted successfully';
+      this.updateTreeView();
     }
   }
 
@@ -155,6 +168,7 @@ export class AppComponent implements OnInit, OnDestroy {
             this.scenarioJson = content;
             this.editorError = '';
             this.statusMessage = `Scenario loaded from "${file.name}"`;
+            this.updateTreeView();
           } catch (error: any) {
             this.editorError = 'Invalid JSON file: ' + error.message;
           }
@@ -164,6 +178,74 @@ export class AppComponent implements OnInit, OnDestroy {
     };
 
     input.click();
+  }
+
+  updateTreeView() {
+    this.scenarioTree = [];
+    if (!this.scenarioJson.trim()) {
+      return;
+    }
+
+    try {
+      const scenario = JSON.parse(this.scenarioJson);
+      this.scenarioTree = this.buildTreeFromScenario(scenario);
+    } catch (error) {
+      // Invalid JSON, tree will remain empty
+    }
+  }
+
+  private extractTypeFromClass(className: string): string {
+    if (!className) {
+      return 'Unknown';
+    }
+    // Split by dots and take the last part
+    const parts = className.split('.');
+    return parts[parts.length - 1];
+  }
+
+  private generateNodeName(name: string, type: string): string {
+    if (name) {
+      return name;
+    }
+    // Convert type to camelCase
+    return type.charAt(0).toLowerCase() + type.slice(1);
+  }
+
+  private buildTreeNode(obj: any, defaultExpanded: boolean = false): TreeNode {
+    const type = this.extractTypeFromClass(obj['@class']);
+    const name = this.generateNodeName(obj.name, type);
+
+    return {
+      name: name,
+      type: type,
+      children: obj.children && Array.isArray(obj.children) ? this.buildTreeFromChildren(obj.children) : [],
+      expanded: defaultExpanded
+    };
+  }
+
+  private buildTreeFromScenario(scenario: any): TreeNode[] {
+    const nodes: TreeNode[] = [];
+
+    if (scenario) {
+      const rootNode = this.buildTreeNode(scenario, true);
+      nodes.push(rootNode);
+    }
+
+    return nodes;
+  }
+
+  private buildTreeFromChildren(children: any[]): TreeNode[] {
+    return children.map(child => this.buildTreeNode(child, false));
+  }
+
+  getNodeIcon(node: TreeNode): string {
+    switch (node.type.toLowerCase()) {
+      case 'scenario':
+        return '🏗️';
+      case 'activeobject':
+      default:
+        return '📦';
+    }
   }
 
 

@@ -73,20 +73,52 @@
 
   <section class="editor-section">
     <div class="editor-container">
-      <label for="scenario-editor">Scenario JSON Editor</label>
-      <textarea
-        id="scenario-editor"
-        #scenarioEditor
-        [value]="scenarioJson"
-        (input)="scenarioJson = scenarioEditor.value"
-        rows="25"
-        cols="100"
-        spellcheck="false"
-        placeholder="Load or paste scenario JSON here..."
-      ></textarea>
-      <div class="editor-error" *ngIf="editorError">
-        <span class="error-icon">⚠️</span>
-        {{ editorError }}
+      <div class="editor-layout">
+        <div class="treeview-panel">
+          <label>Scenario Tree View</label>
+          <div class="treeview-container" *ngIf="scenarioTree.length > 0">
+            <div class="tree-root">
+              <ng-container *ngFor="let node of scenarioTree">
+                <ng-container *ngTemplateOutlet="treeNodeTemplate; context: { node: node }"></ng-container>
+              </ng-container>
+            </div>
+
+            <ng-template #treeNodeTemplate let-node="node">
+              <details class="tree-node" [open]="node.expanded">
+                <summary class="tree-item">
+                  <span class="tree-icon">{{ getNodeIcon(node) }}</span>
+                  <span class="tree-label">{{ node.name }}</span>
+                  <span class="tree-type">{{ node.type }}</span>
+                </summary>
+                <div class="tree-children" *ngIf="node.children && node.children.length > 0">
+                  <ng-container *ngFor="let child of node.children">
+                    <ng-container *ngTemplateOutlet="treeNodeTemplate; context: { node: child }"></ng-container>
+                  </ng-container>
+                </div>
+              </details>
+            </ng-template>
+          </div>
+          <div class="treeview-empty" *ngIf="scenarioTree.length === 0">
+            <span>No scenario loaded</span>
+          </div>
+        </div>
+        <div class="editor-panel">
+          <label for="scenario-editor">Scenario JSON Editor</label>
+          <textarea
+            id="scenario-editor"
+            #scenarioEditor
+            [value]="scenarioJson"
+            (input)="scenarioJson = scenarioEditor.value; updateTreeView()"
+            rows="25"
+            cols="100"
+            spellcheck="false"
+            placeholder="Load or paste scenario JSON here..."
+          ></textarea>
+          <div class="editor-error" *ngIf="editorError">
+            <span class="error-icon">⚠️</span>
+            {{ editorError }}
+          </div>
+        </div>
       </div>
     </div>
   </section>

@@ -20,6 +20,7 @@ A real-time, web-based discrete event simulator built with **Java/Quarkus** back
 - Backup/restore snapshots
 - Load/edit scenarios via JSON editor
 - **File save/load**: Save scenarios as JSON files, load from local files
+- **Tree view**: Hierarchical visualization of scenario structure with unlimited nesting depth, showing actual class names from @class properties (with fallback to 'Unknown' type and camelCase names)
 - Unique ID-based object lookup
 
 ✅ **Real-Time Monitoring**
@@ -97,6 +98,7 @@ mvn quarkus:dev
    - Click "Generate Scenario"
    - Optional: manually edit JSON in editor and click "Post Scenario" to load
    - **File Operations**: Save current scenario as JSON file, or load scenario from local JSON file
+   - **Tree View**: Expandable hierarchical view shows scenario structure at a glance, displaying actual Java class names from @class properties (with intelligent fallbacks for missing data)
 
 3. **Run Simulation**
    - Click "Start"
