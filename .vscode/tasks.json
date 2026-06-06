@@ -4,13 +4,7 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Build container image",
-            "type": "shell",
-            "command": "docker build ${workspaceFolder}/.devcontainer/ -f ${workspaceFolder}/.devcontainer/Containerfile -t dev/quarkus && docker system prune -f",
-            "group": "build"
-        },
-        {
-            "label": "Run Quarkus app",
+            "label": "Start Quarkus dev app",
             "type": "shell",
             "command": "mvn quarkus:dev",
             "group": "build"
@@ -22,9 +16,27 @@
             "group": "build"
         },
         {
+            "label": "Build jar with coverage",
+            "type": "shell",
+            "command": "mvn clean package -Dquarkus.profile=coverage",
+            "group": "build"
+        },
+        {
             "label": "Build native",
             "type": "shell",
             "command": "mvn clean package -Pnative",
+            "group": "build"
+        },
+        {
+            "label": "Build container image",
+            "type": "shell",
+            "command": "docker build ${workspaceFolder}/.devcontainer/ -f ${workspaceFolder}/.devcontainer/Containerfile -t dev/quarkus && docker system prune -f",
+            "group": "build"
+        },
+        {
+            "label": "Run Quarkus app",
+            "type": "shell",
+            "command": "mvn quarkus:run",
             "group": "build"
         }
     ]

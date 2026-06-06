@@ -76,6 +76,10 @@
               "optimization": false,
               "extractLicenses": false,
               "sourceMap": true
+            },
+            "coverage": {
+              "optimization": false,
+              "sourceMap": true
             }
           },
           "defaultConfiguration": "production"
