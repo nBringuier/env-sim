@@ -2,28 +2,39 @@
 /**
  * coverage-controller.mjs
  *
- * Serveur de contrôle de couverture de code pour tests manuels.
- * À lancer sur la machine cible (où tourne l'app Angular/Quarkus).
+ * Tourne sur la machine du TESTEUR.
+ * Se connecte au Chromium de la machine CIBLE via CDP réseau direct
+ * (Chromium lancé avec --remote-debugging-address=0.0.0.0).
  *
  * Usage:
  *   node controller.mjs [options]
  *
  * Options:
  *   --port        Port du serveur de contrôle         (défaut: 9223)
- *   --app-url     URL de l'application à tester       (défaut: http://localhost:8080)
- *   --chromium    Chemin vers l'exécutable Chromium    (défaut: détection automatique)
- *   --dist        Dossier de build Angular             (défaut: ./dist/app-angular/browser)
+ *   --target      IP/hostname de la machine cible     (défaut: localhost)
+ *   --cdp-port    Port CDP sur la machine cible        (défaut: 9222)
+ *   --app-port    Port de l'app sur la machine cible   (défaut: 8080)
+ *   --dist        Dossier de build Angular avec .map   (défaut: ./dist/app-angular/browser)
  *   --src         Dossier source TypeScript            (défaut: ./src)
  *   --sessions    Dossier de stockage des sessions     (défaut: ./coverage-sessions)
  *   --report      Dossier de sortie des rapports       (défaut: ./coverage-report)
+ *
+ * Exemple:
+ *   node controller.mjs --target 192.168.1.42
+ *
+ * Prérequis sur la machine cible :
+ *   chromium --remote-debugging-port=9222 \
+ *            --remote-debugging-address=0.0.0.0 \
+ *            --no-sandbox \
+ *            http://localhost:8080
  */
 
-import express    from 'express';
+import express           from 'express';
 import { WebSocketServer } from 'ws';
-import http       from 'node:http';
-import fs         from 'node:fs';
-import path       from 'node:path';
-import { spawn, execSync }  from 'node:child_process';
+import http              from 'node:http';
+import fs                from 'node:fs';
+import path              from 'node:path';
+import { execSync }      from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 
@@ -38,37 +49,21 @@ function getArg(name, fallback) {
   return idx !== -1 ? args[idx + 1] : fallback;
 }
 
-const CONTROLLER_PORT = parseInt(getArg('--port',     '9223'));
-const APP_URL         = getArg('--app-url',  'http://localhost:8080');
+const CONTROLLER_PORT = parseInt(getArg('--port',      '9223'));
+const TARGET_HOST     = getArg('--target',   'localhost');
+const CDP_PORT        = parseInt(getArg('--cdp-port',  '9222'));
+const APP_PORT        = parseInt(getArg('--app-port',  '8080'));
 const DIST_DIR        = path.resolve(getArg('--dist',    './dist/app-angular/browser'));
 const SRC_DIR         = path.resolve(getArg('--src',     './src'));
 const SESSIONS_DIR    = path.resolve(getArg('--sessions','./coverage-sessions'));
 const REPORT_DIR      = path.resolve(getArg('--report',  './coverage-report'));
-const CDP_PORT        = 9222;
 
-// ─── Chromium detection ───────────────────────────────────────────────────────
+// URL de l'app telle qu'elle est vue depuis la machine cible elle-même
+// (Chromium tourne sur la cible, donc localhost:8080 est correct pour lui)
+const APP_URL_LOCAL  = `http://localhost:${APP_PORT}`;
 
-function findChromium() {
-  if (args.includes('--chromium')) return getArg('--chromium', '');
-  const candidates = [
-    // Windows
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files\\Chromium\\Application\\chrome.exe',
-    // Linux
-    '/usr/bin/chromium-browser',
-    '/usr/bin/chromium',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    // macOS
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    '/Applications/Chromium.app/Contents/MacOS/Chromium',
-  ];
-  for (const c of candidates) {
-    if (fs.existsSync(c)) return c;
-  }
-  return null;
-}
+// URL CDP : depuis la machine testeur, on pointe vers la cible
+const CDP_URL        = `http://${TARGET_HOST}:${CDP_PORT}`;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -88,18 +83,15 @@ function listSessions() {
     .filter(f => f.endsWith('.json'))
     .map(f => {
       const fullPath = path.join(SESSIONS_DIR, f);
-      const stat = fs.statSync(fullPath);
+      const stat     = fs.statSync(fullPath);
       let meta = {};
-      try {
-        const raw = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
-        meta = raw._meta || {};
-      } catch {}
+      try { meta = JSON.parse(fs.readFileSync(fullPath, 'utf8'))._meta || {}; } catch {}
       return {
         id:       path.basename(f, '.json'),
         filename: f,
         size:     stat.size,
         date:     stat.mtime.toISOString(),
-        label:    meta.label || '',
+        label:    meta.label    || '',
         duration: meta.duration || 0,
       };
     })
@@ -109,7 +101,7 @@ function listSessions() {
 // ─── Dependency check ────────────────────────────────────────────────────────
 
 log('Vérification des dépendances…');
-const NEEDED = ['v8-to-istanbul', '@bcoe/v8-coverage', 'nyc'];
+const NEEDED  = ['v8-to-istanbul', '@bcoe/v8-coverage', 'nyc'];
 const missing = NEEDED.filter(pkg => {
   try { require.resolve(pkg); return false; } catch { return true; }
 });
@@ -127,77 +119,55 @@ ensureDir(REPORT_DIR);
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
-let chromiumProcess = null;
-let cdpSession      = null;   // puppeteer CDPSession
-let browser         = null;   // puppeteer Browser
-let page            = null;   // puppeteer Page
-let sessionStart    = null;
-let isRecording     = false;
+let browser      = null;
+let page         = null;
+let cdpSession   = null;
+let sessionStart = null;
+let isRecording  = false;
 
-// ─── Chromium launch ─────────────────────────────────────────────────────────
+// ─── CDP connection ───────────────────────────────────────────────────────────
 
-async function launchChromium() {
-  const chromiumPath = findChromium();
-  if (!chromiumPath) throw new Error('Chromium introuvable. Utilisez --chromium <chemin>');
-
-  log(`Lancement de Chromium: ${chromiumPath}`);
-
-  // Kill any existing chromium on that debug port
-  try { execSync(`pkill -f "remote-debugging-port=${CDP_PORT}"`, { stdio: 'ignore' }); } catch {}
-  await new Promise(r => setTimeout(r, 500));
-
-  chromiumProcess = spawn(chromiumPath, [
-    `--remote-debugging-port=${CDP_PORT}`,
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--disable-background-networking',
-    '--disable-extensions',
-    '--user-data-dir=/tmp/chromium-coverage-profile',
-    APP_URL,
-  ], { detached: true, stdio: 'ignore' });
-
-  chromiumProcess.unref();
-
-  // Wait for CDP to be ready
-  for (let i = 0; i < 20; i++) {
-    try {
-      const res = await fetch(`http://localhost:${CDP_PORT}/json/version`);
-      if (res.ok) { ok('Chromium démarré'); return; }
-    } catch {}
-    await new Promise(r => setTimeout(r, 500));
+async function checkCdpReachable() {
+  // Vérifie que Chromium sur la cible est bien accessible
+  try {
+    const res = await fetch(`${CDP_URL}/json/version`, { signal: AbortSignal.timeout(2000) });
+    return res.ok;
+  } catch {
+    return false;
   }
-  throw new Error('Chromium n\'a pas répondu sur le port CDP');
 }
 
 async function connectCDP() {
   const puppeteer = await import('puppeteer-core');
+
   browser = await puppeteer.connect({
-    browserURL: `http://localhost:${CDP_PORT}`,
+    browserURL:      CDP_URL,   // ← pointe directement vers la machine cible
     defaultViewport: null,
   });
 
   const pages = await browser.pages();
   page = pages[0] || await browser.newPage();
 
-  // Navigate to app if not already there
-  if (!page.url().startsWith(APP_URL)) {
-    await page.goto(APP_URL, { waitUntil: 'networkidle2' });
+  // Si la page n'est pas sur l'app, on y navigue
+  // (localhost ici = localhost VU PAR CHROMIUM, donc la machine cible)
+  if (!page.url().startsWith(APP_URL_LOCAL)) {
+    await page.goto(APP_URL_LOCAL, { waitUntil: 'networkidle2' });
   }
 
   cdpSession = await page.createCDPSession();
-  ok('CDP connecté');
+  ok(`CDP connecté → ${CDP_URL}`);
 }
 
 async function startPreciseCoverage() {
   await cdpSession.send('Profiler.enable');
   await cdpSession.send('Profiler.startPreciseCoverage', {
-    callCount:  true,
-    detailed:   true,
+    callCount:             true,
+    detailed:              true,
     allowTriggeredUpdates: false,
   });
   sessionStart = Date.now();
   isRecording  = true;
-  ok('Collecte précise démarrée');
+  ok('Collecte précise démarrée (fonctions incluses)');
 }
 
 async function stopAndCollect(label) {
@@ -209,19 +179,20 @@ async function stopAndCollect(label) {
   const duration = Date.now() - sessionStart;
   const id       = sessionId();
 
-  // Filter only app JS bundles
-  const filtered = result.filter(e =>
-    e.url && e.url.includes(APP_URL) && e.url.endsWith('.js')
+  // On garde uniquement les bundles de l'app (filtre sur l'URL)
+  const appOrigin = `http://localhost:${APP_PORT}`;
+  const filtered  = result.filter(e =>
+    e.url && e.url.startsWith(appOrigin) && e.url.endsWith('.js')
   );
 
   const sessionData = {
-    _meta: { id, label, duration, date: new Date().toISOString(), appUrl: APP_URL },
+    _meta:  { id, label, duration, date: new Date().toISOString(), target: TARGET_HOST },
     result: filtered,
   };
 
   const outFile = path.join(SESSIONS_DIR, `${id}.json`);
   fs.writeFileSync(outFile, JSON.stringify(sessionData, null, 2));
-  ok(`Session sauvegardée: ${id} (${filtered.length} bundles, ${duration}ms)`);
+  ok(`Session sauvegardée : ${id}  (${filtered.length} bundle(s), ${(duration/1000).toFixed(0)}s)`);
   return { id, duration, bundleCount: filtered.length };
 }
 
@@ -232,36 +203,43 @@ function findAllTsFiles(dir) {
   if (!fs.existsSync(dir)) return results;
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) results.push(...findAllTsFiles(full));
-    else if (entry.name.endsWith('.ts') && !entry.name.endsWith('.spec.ts') && !entry.name.endsWith('.d.ts'))
+    if (entry.isDirectory()) {
+      results.push(...findAllTsFiles(full));
+    } else if (
+      entry.name.endsWith('.ts') &&
+      !entry.name.endsWith('.spec.ts') &&
+      !entry.name.endsWith('.d.ts')
+    ) {
       results.push(full);
+    }
   }
   return results;
 }
 
 function buildZeroEntry(absPath, relKey) {
-  const lines = fs.readFileSync(absPath, 'utf8').split('\n');
-  const statementMap = {}, s = {};
+  const lines        = fs.readFileSync(absPath, 'utf8').split('\n');
+  const statementMap = {};
+  const s            = {};
   let idx = 0;
   lines.forEach((line, lineNum) => {
     if (!line.trim()) return;
-    statementMap[idx] = { start: { line: lineNum + 1, column: 0 }, end: { line: lineNum + 1, column: line.length } };
-    s[idx] = 0; idx++;
+    statementMap[idx] = {
+      start: { line: lineNum + 1, column: 0 },
+      end:   { line: lineNum + 1, column: line.length },
+    };
+    s[idx] = 0;
+    idx++;
   });
   return { path: relKey, statementMap, fnMap: {}, branchMap: {}, s, f: {}, b: {} };
 }
 
-async function generateReport(sessionIds, reportLabel) {
+async function generateReport(sessionIds) {
   const nycOutput = path.join(REPORT_DIR, '.nyc_output');
   ensureDir(nycOutput);
-
-  // Clean previous nyc output
   fs.readdirSync(nycOutput).forEach(f => fs.unlinkSync(path.join(nycOutput, f)));
 
-  // Load & merge selected sessions
   const allSessions = sessionIds.map(id => {
-    const file = path.join(SESSIONS_DIR, `${id}.json`);
-    const raw  = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const raw = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, `${id}.json`), 'utf8'));
     return { result: raw.result };
   });
 
@@ -269,29 +247,31 @@ async function generateReport(sessionIds, reportLabel) {
     ? allSessions[0].result
     : mergeProcessCovs(allSessions).result;
 
-  const SRC_PREFIX = path.relative(process.cwd(), SRC_DIR).replace(/\\/g, '/') + '/';
+  const SRC_PREFIX   = path.relative(process.cwd(), SRC_DIR).replace(/\\/g, '/') + '/';
   const coveredFiles = new Set();
   let fileIdx = 0;
 
   for (const entry of merged) {
-    if (!entry.url || !entry.url.endsWith('.js')) continue;
+    if (!entry.url?.endsWith('.js')) continue;
 
     const bundleName = path.basename(new URL(entry.url).pathname);
     const bundlePath = path.join(DIST_DIR, bundleName);
-
-    if (!fs.existsSync(bundlePath) || !fs.existsSync(bundlePath + '.map')) continue;
+    if (!fs.existsSync(bundlePath) || !fs.existsSync(bundlePath + '.map')) {
+      warn(`Bundle ou .map absent, ignoré : ${bundleName}`);
+      continue;
+    }
 
     try {
-      // entry.functions est déjà au bon format V8 (Profiler.takePreciseCoverage)
       const converter = v8toIstanbul(bundlePath);
       await converter.load();
+      // entry.functions est au format natif V8 → colonnes Functions correctes ✅
       converter.applyCoverage(entry.functions || []);
-
       const data = converter.toIstanbul();
+
       for (const [filePath, fileData] of Object.entries(data)) {
-        const norm   = filePath.replace(/\\/g, '/');
+        const norm = filePath.replace(/\\/g, '/');
         if (!norm.includes(SRC_PREFIX)) continue;
-        const relKey = norm.slice(norm.indexOf(SRC_PREFIX));
+        const relKey  = norm.slice(norm.indexOf(SRC_PREFIX));
         fileData.path = relKey;
         coveredFiles.add(relKey);
         fs.writeFileSync(
@@ -304,7 +284,7 @@ async function generateReport(sessionIds, reportLabel) {
     }
   }
 
-  // Add zero-coverage files
+  // Fichiers jamais chargés → 0% sur toutes les colonnes
   let zeroCount = 0;
   for (const absPath of findAllTsFiles(SRC_DIR)) {
     const relKey = path.relative(process.cwd(), absPath).replace(/\\/g, '/');
@@ -315,42 +295,56 @@ async function generateReport(sessionIds, reportLabel) {
     );
   }
 
-  // Run nyc report
   const nycBin = path.resolve(__dirname, 'node_modules/.bin/nyc');
   execSync(
     `"${nycBin}" report --reporter=html --reporter=text-summary --report-dir="${REPORT_DIR}" --temp-dir="${nycOutput}"`,
     { stdio: 'pipe', cwd: __dirname }
   );
 
-  ok(`Rapport généré: ${REPORT_DIR}/index.html`);
-  return { reportDir: REPORT_DIR, coveredFiles: coveredFiles.size, zeroFiles: zeroCount };
+  ok(`Rapport généré : ${REPORT_DIR}/index.html`);
+  return { coveredFiles: coveredFiles.size, zeroFiles: zeroCount };
 }
 
-// ─── Express API ─────────────────────────────────────────────────────────────
+// ─── Express + WebSocket ─────────────────────────────────────────────────────
 
 const app    = express();
 const server = http.createServer(app);
+const wss    = new WebSocketServer({ server });
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Status
-app.get('/api/status', (req, res) => {
+function broadcast(data) {
+  const msg = JSON.stringify(data);
+  wss.clients.forEach(c => { if (c.readyState === 1) c.send(msg); });
+}
+
+// Push timer toutes les secondes
+setInterval(() => {
+  if (isRecording && sessionStart) {
+    broadcast({ type: 'tick', elapsed: Date.now() - sessionStart });
+  }
+}, 1000);
+
+// ─── API ─────────────────────────────────────────────────────────────────────
+
+app.get('/api/status', async (req, res) => {
+  const cdpReachable = browser ? true : await checkCdpReachable();
   res.json({
     isRecording,
-    sessionStart,
-    elapsed: sessionStart ? Date.now() - sessionStart : 0,
-    appUrl:  APP_URL,
+    elapsed:       sessionStart ? Date.now() - sessionStart : 0,
+    target:        TARGET_HOST,
+    cdpUrl:        CDP_URL,
+    appUrl:        `http://${TARGET_HOST}:${APP_PORT}`,
     chromiumReady: !!browser,
+    cdpReachable,
   });
 });
 
-// Sessions list
-app.get('/api/sessions', (req, res) => {
+app.get('/api/sessions', (_req, res) => {
   res.json(listSessions());
 });
 
-// Delete session(s)
 app.delete('/api/sessions', (req, res) => {
   const { ids } = req.body;
   for (const id of ids) {
@@ -360,22 +354,31 @@ app.delete('/api/sessions', (req, res) => {
   res.json({ deleted: ids });
 });
 
-// Start session
 app.post('/api/session/start', async (req, res) => {
   try {
     if (isRecording) return res.status(400).json({ error: 'Session déjà en cours' });
+
+    if (!await checkCdpReachable()) {
+      return res.status(503).json({
+        error: `Chromium non accessible sur ${CDP_URL}.\n` +
+               `Lancez-le sur la machine cible avec :\n` +
+               `  chromium --remote-debugging-port=${CDP_PORT} --remote-debugging-address=0.0.0.0 --no-sandbox http://localhost:${APP_PORT}`
+      });
+    }
+
     if (!browser) {
-      await launchChromium();
       await connectCDP();
     } else {
-      // Refresh the page and reconnect CDP
+      // Nouvelle session : on recharge la page pour repartir d'un état propre
       try {
         await page.reload({ waitUntil: 'networkidle2' });
       } catch {
+        // Page perdue (ex: navigation manuelle), on reconnecte
         await connectCDP();
-        await page.goto(APP_URL, { waitUntil: 'networkidle2' });
+        await page.goto(APP_URL_LOCAL, { waitUntil: 'networkidle2' });
       }
     }
+
     await startPreciseCoverage();
     res.json({ ok: true, startedAt: sessionStart });
   } catch (err) {
@@ -384,12 +387,10 @@ app.post('/api/session/start', async (req, res) => {
   }
 });
 
-// Stop session
 app.post('/api/session/stop', async (req, res) => {
   try {
     if (!isRecording) return res.status(400).json({ error: 'Aucune session en cours' });
-    const { label } = req.body;
-    const result = await stopAndCollect(label || '');
+    const result = await stopAndCollect(req.body.label || '');
     res.json({ ok: true, ...result });
   } catch (err) {
     warn(err.message);
@@ -397,13 +398,11 @@ app.post('/api/session/stop', async (req, res) => {
   }
 });
 
-// Generate report
 app.post('/api/report', async (req, res) => {
   try {
-    const { sessionIds, label } = req.body;
-    if (!sessionIds || !sessionIds.length)
-      return res.status(400).json({ error: 'Aucune session sélectionnée' });
-    const result = await generateReport(sessionIds, label);
+    const { sessionIds } = req.body;
+    if (!sessionIds?.length) return res.status(400).json({ error: 'Aucune session sélectionnée' });
+    const result = await generateReport(sessionIds);
     res.json({ ok: true, ...result });
   } catch (err) {
     warn(err.message);
@@ -411,33 +410,22 @@ app.post('/api/report', async (req, res) => {
   }
 });
 
-// Serve generated report
 app.use('/report', express.static(REPORT_DIR));
-
-// ─── WebSocket (push état temps réel) ────────────────────────────────────────
-
-const wss = new WebSocketServer({ server });
-
-function broadcast(data) {
-  const msg = JSON.stringify(data);
-  wss.clients.forEach(client => {
-    if (client.readyState === 1) client.send(msg);
-  });
-}
-
-// Push elapsed time while recording
-setInterval(() => {
-  if (isRecording && sessionStart) {
-    broadcast({ type: 'tick', elapsed: Date.now() - sessionStart });
-  }
-}, 1000);
 
 // ─── Start ───────────────────────────────────────────────────────────────────
 
 server.listen(CONTROLLER_PORT, '0.0.0.0', () => {
-  ok(`Controller démarré sur http://0.0.0.0:${CONTROLLER_PORT}`);
-  log(`App cible : ${APP_URL}`);
-  log(`Sessions  : ${SESSIONS_DIR}`);
-  log(`Rapports  : ${REPORT_DIR}`);
-  log(`Dist      : ${DIST_DIR}`);
+  ok(`Controller démarré → http://0.0.0.0:${CONTROLLER_PORT}`);
+  log(`Machine cible    : ${TARGET_HOST}`);
+  log(`CDP cible        : ${CDP_URL}`);
+  log(`App cible        : http://${TARGET_HOST}:${APP_PORT}`);
+  log(`Sessions         : ${SESSIONS_DIR}`);
+  log(`Rapports         : ${REPORT_DIR}`);
+  log(`Dist (.map)      : ${DIST_DIR}`);
+  log('');
+  log('Prérequis sur la machine cible :');
+  log(`  chromium --remote-debugging-port=${CDP_PORT} \\`);
+  log(`           --remote-debugging-address=0.0.0.0 \\`);
+  log(`           --no-sandbox \\`);
+  log(`           http://localhost:${APP_PORT}`);
 });
