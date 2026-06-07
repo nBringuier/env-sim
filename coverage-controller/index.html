@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Coverage Controller</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0d0f12;
+      --surface:   #141720;
+      --border:    #252a35;
+      --border2:   #1e2330;
+      --text:      #c8d0de;
+      --text-dim:  #5a6478;
+      --text-mid:  #8892a4;
+      --accent:    #00e5a0;
+      --accent-dim:#00b07a;
+      --danger:    #ff4757;
+      --warn:      #ffa726;
+      --info:      #42a5f5;
+      --recording: #ff4757;
+    }
+
+    html, body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'IBM Plex Sans', sans-serif;
+      font-size: 14px;
+      min-height: 100vh;
+    }
+
+    /* ── Layout ── */
+    .layout {
+      display: grid;
+      grid-template-rows: 56px 1fr;
+      grid-template-columns: 280px 1fr;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Header ── */
+    header {
+      grid-column: 1 / -1;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 24px;
+      gap: 16px;
+    }
+    .logo {
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--accent);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .logo span { color: var(--text-dim); }
+    .header-sep { flex: 1; }
+    .conn-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--text-dim);
+      transition: background 0.3s;
+    }
+    .conn-dot.live { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+    .conn-label { font-size: 11px; color: var(--text-dim); font-family: 'IBM Plex Mono', monospace; }
+
+    /* ── Sidebar ── */
+    .sidebar {
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .section-title {
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      padding: 20px 20px 10px;
+    }
+
+    /* ── Recording panel ── */
+    .rec-panel {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border2);
+    }
+
+    .timer {
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 32px;
+      font-weight: 500;
+      color: var(--text);
+      letter-spacing: 0.04em;
+      margin-bottom: 4px;
+      transition: color 0.3s;
+    }
+    .timer.active { color: var(--recording); }
+
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 8px;
+      border-radius: 2px;
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .status-badge.idle    { background: #1a1f2a; color: var(--text-dim); border: 1px solid var(--border); }
+    .status-badge.recording { background: rgba(255,71,87,0.12); color: var(--recording); border: 1px solid rgba(255,71,87,0.3); }
+    .status-badge .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .status-badge.recording .dot { animation: blink 1s infinite; }
+    @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0.2; } }
+
+    .label-input {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 8px 10px;
+      color: var(--text);
+      font-family: 'IBM Plex Sans', sans-serif;
+      font-size: 13px;
+      margin-bottom: 12px;
+      transition: border-color 0.2s;
+    }
+    .label-input:focus { outline: none; border-color: var(--accent-dim); }
+    .label-input::placeholder { color: var(--text-dim); }
+    .label-input:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .btn {
+      width: 100%;
+      padding: 10px 16px;
+      border: none;
+      border-radius: 3px;
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: all 0.15s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+    .btn:disabled { opacity: 0.35; cursor: not-allowed; }
+    .btn-start { background: var(--accent); color: #0a0f0d; }
+    .btn-start:hover:not(:disabled) { background: #00ffc0; }
+    .btn-stop  { background: rgba(255,71,87,0.15); color: var(--recording); border: 1px solid rgba(255,71,87,0.4); }
+    .btn-stop:hover:not(:disabled) { background: rgba(255,71,87,0.25); }
+    .btn-report { background: rgba(66,165,245,0.12); color: var(--info); border: 1px solid rgba(66,165,245,0.3); margin-top: 8px; }
+    .btn-report:hover:not(:disabled) { background: rgba(66,165,245,0.22); }
+
+    /* ── Sessions list ── */
+    .sessions-header {
+      display: flex;
+      align-items: center;
+      padding: 16px 20px 8px;
+      gap: 8px;
+    }
+    .sessions-header .section-title { padding: 0; flex: 1; }
+    .sel-count {
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 10px;
+      color: var(--accent);
+      background: rgba(0,229,160,0.1);
+      padding: 1px 6px;
+      border-radius: 2px;
+    }
+    .btn-del-sel {
+      background: none;
+      border: 1px solid rgba(255,71,87,0.3);
+      border-radius: 2px;
+      color: var(--danger);
+      font-size: 10px;
+      font-family: 'IBM Plex Mono', monospace;
+      padding: 2px 8px;
+      cursor: pointer;
+      display: none;
+    }
+    .btn-del-sel:hover { background: rgba(255,71,87,0.1); }
+    .btn-del-sel.visible { display: block; }
+
+    .sessions-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 0 12px 12px;
+    }
+    .sessions-list::-webkit-scrollbar { width: 4px; }
+    .sessions-list::-webkit-scrollbar-track { background: transparent; }
+    .sessions-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    .session-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 10px;
+      border-radius: 4px;
+      border: 1px solid transparent;
+      cursor: pointer;
+      transition: all 0.15s;
+      margin-bottom: 4px;
+    }
+    .session-item:hover { background: rgba(255,255,255,0.03); border-color: var(--border2); }
+    .session-item.selected { background: rgba(0,229,160,0.06); border-color: rgba(0,229,160,0.2); }
+
+    .session-cb {
+      width: 14px; height: 14px;
+      border: 1px solid var(--border);
+      border-radius: 2px;
+      margin-top: 2px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.15s;
+    }
+    .session-item.selected .session-cb {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+    .session-cb::after {
+      content: '';
+      width: 8px; height: 5px;
+      border-left: 2px solid #0a0f0d;
+      border-bottom: 2px solid #0a0f0d;
+      transform: rotate(-45deg) translateY(-1px);
+      opacity: 0;
+      transition: opacity 0.15s;
+    }
+    .session-item.selected .session-cb::after { opacity: 1; }
+
+    .session-info { flex: 1; min-width: 0; }
+    .session-label {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .session-meta {
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 10px;
+      color: var(--text-dim);
+      margin-top: 2px;
+    }
+    .session-dur {
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 10px;
+      color: var(--text-mid);
+      margin-top: 1px;
+    }
+
+    .sessions-empty {
+      text-align: center;
+      padding: 32px 16px;
+      color: var(--text-dim);
+      font-size: 12px;
+      font-style: italic;
+    }
+
+    /* ── Main content ── */
+    .main {
+      overflow: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 20px;
+    }
+    .card-title {
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin-bottom: 16px;
+    }
+
+    /* ── Config grid ── */
+    .config-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 12px;
+    }
+    .config-item label {
+      display: block;
+      font-size: 10px;
+      font-family: 'IBM Plex Mono', monospace;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin-bottom: 4px;
+    }
+    .config-val {
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 12px;
+      color: var(--accent);
+      background: rgba(0,229,160,0.06);
+      padding: 5px 8px;
+      border-radius: 3px;
+      border: 1px solid rgba(0,229,160,0.15);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* ── Log ── */
+    .log-box {
+      background: var(--bg);
+      border: 1px solid var(--border2);
+      border-radius: 4px;
+      padding: 12px;
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 11px;
+      line-height: 1.8;
+      max-height: 200px;
+      overflow-y: auto;
+      color: var(--text-mid);
+    }
+    .log-box::-webkit-scrollbar { width: 4px; }
+    .log-box::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+    .log-entry { display: flex; gap: 10px; }
+    .log-time { color: var(--text-dim); flex-shrink: 0; }
+    .log-msg.ok  { color: var(--accent); }
+    .log-msg.err { color: var(--danger); }
+    .log-msg.warn{ color: var(--warn); }
+    .log-msg.info{ color: var(--info); }
+
+    /* ── Report result ── */
+    .report-result {
+      display: none;
+      padding: 16px;
+      background: rgba(0,229,160,0.05);
+      border: 1px solid rgba(0,229,160,0.2);
+      border-radius: 4px;
+    }
+    .report-result.visible { display: block; }
+    .report-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--accent);
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 12px;
+      text-decoration: none;
+      margin-top: 8px;
+    }
+    .report-link:hover { text-decoration: underline; }
+    .report-stats {
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 11px;
+      color: var(--text-mid);
+      margin-top: 4px;
+    }
+
+    /* ── Spinner ── */
+    .spinner {
+      width: 14px; height: 14px;
+      border: 2px solid rgba(255,255,255,0.15);
+      border-top-color: currentColor;
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+      display: none;
+    }
+    .loading .spinner { display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Toast ── */
+    .toasts {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      z-index: 1000;
+    }
+    .toast {
+      padding: 10px 16px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-family: 'IBM Plex Mono', monospace;
+      animation: slideIn 0.2s ease-out;
+      max-width: 320px;
+    }
+    .toast.ok   { background: rgba(0,229,160,0.15); border: 1px solid rgba(0,229,160,0.3); color: var(--accent); }
+    .toast.err  { background: rgba(255,71,87,0.15);  border: 1px solid rgba(255,71,87,0.3);  color: var(--danger); }
+    .toast.info { background: rgba(66,165,245,0.15); border: 1px solid rgba(66,165,245,0.3); color: var(--info); }
+    @keyframes slideIn { from { opacity: 0; transform: translateX(20px); } }
+
+    .select-all-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 10px 8px;
+    }
+    .btn-sel-all {
+      background: none;
+      border: none;
+      color: var(--text-dim);
+      font-size: 10px;
+      font-family: 'IBM Plex Mono', monospace;
+      cursor: pointer;
+      padding: 2px 0;
+      text-decoration: underline;
+    }
+    .btn-sel-all:hover { color: var(--text); }
+  </style>
+</head>
+<body>
+
+<div class="layout">
+
+  <!-- Header -->
+  <header>
+    <div class="logo">Coverage<span>/</span>Controller</div>
+    <div class="header-sep"></div>
+    <div class="conn-dot" id="connDot"></div>
+    <div class="conn-label" id="connLabel">CONNECTING…</div>
+  </header>
+
+  <!-- Sidebar -->
+  <aside class="sidebar">
+
+    <!-- Recording -->
+    <div class="section-title">Session en cours</div>
+    <div class="rec-panel">
+      <div class="timer" id="timer">00:00:00</div>
+      <div class="status-row">
+        <div class="status-badge idle" id="statusBadge">
+          <div class="dot"></div>
+          <span id="statusText">Inactif</span>
+        </div>
+      </div>
+
+      <input type="text" class="label-input" id="labelInput"
+             placeholder="Libellé de la session (optionnel)">
+
+      <button class="btn btn-start" id="btnStart" onclick="startSession()">
+        <div class="spinner"></div>
+        <span>▶ Démarrer</span>
+      </button>
+      <button class="btn btn-stop" id="btnStop" onclick="stopSession()" disabled>
+        <div class="spinner"></div>
+        <span>⏹ Arrêter</span>
+      </button>
+    </div>
+
+    <!-- Sessions -->
+    <div class="sessions-header">
+      <div class="section-title">Sessions</div>
+      <div class="sel-count" id="selCount" style="display:none"></div>
+      <button class="btn-del-sel" id="btnDelSel" onclick="deleteSelected()">Supprimer</button>
+    </div>
+    <div class="select-all-row">
+      <button class="btn-sel-all" onclick="selectAll()">Tout sélectionner</button>
+      <button class="btn-sel-all" onclick="selectNone()">Désélectionner</button>
+    </div>
+    <div class="sessions-list" id="sessionsList">
+      <div class="sessions-empty">Aucune session</div>
+    </div>
+
+  </aside>
+
+  <!-- Main -->
+  <main class="main">
+
+    <!-- Config -->
+    <div class="card">
+      <div class="card-title">Configuration</div>
+      <div class="config-grid" id="configGrid">
+        <div class="config-item">
+          <label>App URL</label>
+          <div class="config-val" id="cfgAppUrl">—</div>
+        </div>
+        <div class="config-item">
+          <label>Chromium</label>
+          <div class="config-val" id="cfgChromium">—</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Generate report -->
+    <div class="card">
+      <div class="card-title">Générer un rapport</div>
+
+      <button class="btn btn-report" id="btnReport" onclick="generateReport()" disabled>
+        <div class="spinner"></div>
+        <span>📊 Générer le rapport HTML</span>
+      </button>
+
+      <div class="report-result" id="reportResult">
+        <div style="font-size:12px; color: var(--text);">Rapport généré avec succès</div>
+        <div class="report-stats" id="reportStats"></div>
+        <a class="report-link" href="/report" target="_blank">
+          ↗ Ouvrir le rapport
+        </a>
+      </div>
+    </div>
+
+    <!-- Log -->
+    <div class="card" style="flex:1">
+      <div class="card-title">Journal</div>
+      <div class="log-box" id="logBox"></div>
+    </div>
+
+  </main>
+
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script>
+  // ── State ──────────────────────────────────────────────────────────────────
+  let ws;
+  let selectedIds = new Set();
+  let sessions    = [];
+  let isRecording = false;
+  let timerInterval;
+
+  // ── WebSocket ──────────────────────────────────────────────────────────────
+  function connectWS() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}`);
+
+    ws.onopen = () => {
+      document.getElementById('connDot').classList.add('live');
+      document.getElementById('connLabel').textContent = 'CONNECTÉ';
+    };
+
+    ws.onclose = () => {
+      document.getElementById('connDot').classList.remove('live');
+      document.getElementById('connLabel').textContent = 'DÉCONNECTÉ';
+      setTimeout(connectWS, 2000);
+    };
+
+    ws.onmessage = ({ data }) => {
+      const msg = JSON.parse(data);
+      if (msg.type === 'tick') updateTimer(msg.elapsed);
+    };
+  }
+
+  // ── Timer ──────────────────────────────────────────────────────────────────
+  function updateTimer(ms) {
+    const s = Math.floor(ms / 1000);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    document.getElementById('timer').textContent =
+      [h, m, sec].map(n => String(n).padStart(2, '0')).join(':');
+  }
+
+  // ── Status poll ────────────────────────────────────────────────────────────
+  async function pollStatus() {
+    try {
+      const res  = await fetch('/api/status');
+      const data = await res.json();
+      isRecording = data.isRecording;
+
+      document.getElementById('cfgAppUrl').textContent   = data.appUrl || '—';
+      document.getElementById('cfgChromium').textContent = data.chromiumReady ? 'Prêt' : 'Non lancé';
+
+      const badge = document.getElementById('statusBadge');
+      const text  = document.getElementById('statusText');
+      if (data.isRecording) {
+        badge.className = 'status-badge recording';
+        text.textContent = 'Enregistrement';
+        document.getElementById('timer').classList.add('active');
+        if (data.elapsed) updateTimer(data.elapsed);
+      } else {
+        badge.className = 'status-badge idle';
+        text.textContent = 'Inactif';
+        document.getElementById('timer').classList.remove('active');
+      }
+
+      document.getElementById('btnStart').disabled = data.isRecording;
+      document.getElementById('btnStop').disabled  = !data.isRecording;
+      document.getElementById('labelInput').disabled = data.isRecording;
+    } catch {}
+  }
+
+  // ── Sessions ───────────────────────────────────────────────────────────────
+  async function loadSessions() {
+    const res  = await fetch('/api/sessions');
+    sessions   = await res.json();
+    renderSessions();
+    updateSelectionUI();
+  }
+
+  function renderSessions() {
+    const el = document.getElementById('sessionsList');
+    if (!sessions.length) {
+      el.innerHTML = '<div class="sessions-empty">Aucune session enregistrée</div>';
+      return;
+    }
+    el.innerHTML = sessions.map(s => `
+      <div class="session-item ${selectedIds.has(s.id) ? 'selected' : ''}"
+           onclick="toggleSession('${s.id}')">
+        <div class="session-cb"></div>
+        <div class="session-info">
+          <div class="session-label">${s.label || s.id}</div>
+          <div class="session-meta">${new Date(s.date).toLocaleString('fr-FR')}</div>
+          <div class="session-dur">${formatDuration(s.duration)} · ${formatSize(s.size)}</div>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  function toggleSession(id) {
+    if (selectedIds.has(id)) selectedIds.delete(id);
+    else selectedIds.add(id);
+    renderSessions();
+    updateSelectionUI();
+  }
+
+  function selectAll()  { sessions.forEach(s => selectedIds.add(s.id));    renderSessions(); updateSelectionUI(); }
+  function selectNone() { selectedIds.clear(); renderSessions(); updateSelectionUI(); }
+
+  function updateSelectionUI() {
+    const n       = selectedIds.size;
+    const countEl = document.getElementById('selCount');
+    const delBtn  = document.getElementById('btnDelSel');
+    const repBtn  = document.getElementById('btnReport');
+
+    if (n > 0) {
+      countEl.style.display = 'block';
+      countEl.textContent   = `${n} sél.`;
+      delBtn.classList.add('visible');
+    } else {
+      countEl.style.display = 'none';
+      delBtn.classList.remove('visible');
+    }
+    repBtn.disabled = n === 0 || isRecording;
+  }
+
+  // ── Actions ────────────────────────────────────────────────────────────────
+  async function startSession() {
+    setLoading('btnStart', true);
+    try {
+      const label = document.getElementById('labelInput').value.trim();
+      const res   = await fetch('/api/session/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      addLog('Session démarrée', 'ok');
+      toast('Enregistrement démarré', 'ok');
+      document.getElementById('timer').textContent = '00:00:00';
+      pollStatus();
+    } catch (err) {
+      addLog(err.message, 'err');
+      toast(err.message, 'err');
+    }
+    setLoading('btnStart', false);
+  }
+
+  async function stopSession() {
+    setLoading('btnStop', true);
+    try {
+      const label = document.getElementById('labelInput').value.trim();
+      const res   = await fetch('/api/session/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      addLog(`Session arrêtée — ${data.bundleCount} bundle(s), ${formatDuration(data.duration)}`, 'ok');
+      toast(`Session "${label || data.id}" sauvegardée`, 'ok');
+      document.getElementById('labelInput').value = '';
+      await pollStatus();
+      await loadSessions();
+    } catch (err) {
+      addLog(err.message, 'err');
+      toast(err.message, 'err');
+    }
+    setLoading('btnStop', false);
+  }
+
+  async function deleteSelected() {
+    if (!selectedIds.size) return;
+    if (!confirm(`Supprimer ${selectedIds.size} session(s) ?`)) return;
+    try {
+      await fetch('/api/sessions', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: [...selectedIds] }),
+      });
+      addLog(`${selectedIds.size} session(s) supprimée(s)`, 'warn');
+      selectedIds.clear();
+      await loadSessions();
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  }
+
+  async function generateReport() {
+    if (!selectedIds.size) return;
+    setLoading('btnReport', true);
+    addLog(`Génération du rapport pour ${selectedIds.size} session(s)…`, 'info');
+    try {
+      const res  = await fetch('/api/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionIds: [...selectedIds] }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      addLog(`Rapport prêt — ${data.coveredFiles} fichiers couverts, ${data.zeroFiles} à 0%`, 'ok');
+      toast('Rapport généré !', 'ok');
+      document.getElementById('reportStats').textContent =
+        `${data.coveredFiles} fichiers couverts · ${data.zeroFiles} fichiers à 0%`;
+      document.getElementById('reportResult').classList.add('visible');
+    } catch (err) {
+      addLog(err.message, 'err');
+      toast(err.message, 'err');
+    }
+    setLoading('btnReport', false);
+  }
+
+  // ── UI helpers ─────────────────────────────────────────────────────────────
+  function setLoading(btnId, loading) {
+    const btn = document.getElementById(btnId);
+    btn.classList.toggle('loading', loading);
+    btn.disabled = loading;
+  }
+
+  function addLog(msg, type = '') {
+    const box  = document.getElementById('logBox');
+    const time = new Date().toLocaleTimeString('fr-FR');
+    const el   = document.createElement('div');
+    el.className = 'log-entry';
+    el.innerHTML = `<span class="log-time">${time}</span><span class="log-msg ${type}">${msg}</span>`;
+    box.appendChild(el);
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function toast(msg, type = 'info') {
+    const el = document.createElement('div');
+    el.className = `toast ${type}`;
+    el.textContent = msg;
+    document.getElementById('toasts').appendChild(el);
+    setTimeout(() => el.remove(), 3500);
+  }
+
+  function formatDuration(ms) {
+    if (!ms) return '—';
+    const s = Math.floor(ms / 1000);
+    if (s < 60)  return `${s}s`;
+    if (s < 3600) return `${Math.floor(s/60)}m${s%60}s`;
+    return `${Math.floor(s/3600)}h${Math.floor((s%3600)/60)}m`;
+  }
+
+  function formatSize(bytes) {
+    if (bytes > 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+    if (bytes > 1024)        return `${(bytes / 1024).toFixed(0)} KB`;
+    return `${bytes} B`;
+  }
+
+  // ── Init ───────────────────────────────────────────────────────────────────
+  connectWS();
+  pollStatus();
+  loadSessions();
+  setInterval(pollStatus,   3000);
+  setInterval(loadSessions, 5000);
+  addLog('Panel initialisé', 'info');
+</script>
+</body>
+</html>
