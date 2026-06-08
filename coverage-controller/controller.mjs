@@ -1,32 +1,24 @@
 #!/usr/bin/env node
 /**
- * coverage-controller.mjs
+ * controller.mjs
  *
- * Tourne sur la machine du TESTEUR.
- * Se connecte au Chromium de la machine CIBLE via CDP réseau direct
- * (Chromium lancé avec --remote-debugging-address=0.0.0.0).
+ * Tourne sur la machine B (WSL).
+ * - Se connecte au CDP de Chromium sur machine A via tunnel SSH
+ *   (tunnel à ouvrir manuellement : ssh -L 9222:localhost:9222 user@machineA)
+ * - Télécharge les .js et .js.map depuis Quarkus (machine A :8080)
+ *   les .map contiennent sourcesContent → pas besoin de src/ en local
+ * - Génère un rapport HTML Istanbul avec couverture par fonction
  *
  * Usage:
  *   node controller.mjs [options]
  *
  * Options:
- *   --port        Port du serveur de contrôle         (défaut: 9223)
- *   --target      IP/hostname de la machine cible     (défaut: localhost)
- *   --cdp-port    Port CDP sur la machine cible        (défaut: 9222)
- *   --app-port    Port de l'app sur la machine cible   (défaut: 8080)
- *   --dist        Dossier de build Angular avec .map   (défaut: ./dist/app-angular/browser)
- *   --src         Dossier source TypeScript            (défaut: ./src)
- *   --sessions    Dossier de stockage des sessions     (défaut: ./coverage-sessions)
- *   --report      Dossier de sortie des rapports       (défaut: ./coverage-report)
- *
- * Exemple:
- *   node controller.mjs --target 192.168.1.42
- *
- * Prérequis sur la machine cible :
- *   chromium --remote-debugging-port=9222 \
- *            --remote-debugging-address=0.0.0.0 \
- *            --no-sandbox \
- *            http://localhost:8080
+ *   --port        Port du panel de contrôle        (défaut: 9223)
+ *   --target      Host:port de l'app Quarkus        (défaut: localhost:8080)
+ *   --cdp-port    Port CDP (bout local du tunnel)   (défaut: 9222)
+ *   --sessions    Dossier sessions                  (défaut: ./coverage-sessions)
+ *   --report      Dossier rapport HTML              (défaut: ./coverage-report)
+ *   --src-prefix  Préfixe des sources à inclure     (défaut: src/)
  */
 
 import express           from 'express';
@@ -49,21 +41,15 @@ function getArg(name, fallback) {
   return idx !== -1 ? args[idx + 1] : fallback;
 }
 
-const CONTROLLER_PORT = parseInt(getArg('--port',      '9223'));
-const TARGET_HOST     = getArg('--target',   'localhost');
-const CDP_PORT        = parseInt(getArg('--cdp-port',  '9222'));
-const APP_PORT        = parseInt(getArg('--app-port',  '8080'));
-const DIST_DIR        = path.resolve(getArg('--dist',    './dist/app-angular/browser'));
-const SRC_DIR         = path.resolve(getArg('--src',     './src'));
-const SESSIONS_DIR    = path.resolve(getArg('--sessions','./coverage-sessions'));
-const REPORT_DIR      = path.resolve(getArg('--report',  './coverage-report'));
+const CONTROLLER_PORT = parseInt(getArg('--port',       '9223'));
+const TARGET          = getArg('--target',    'localhost:8080');
+const CDP_PORT        = parseInt(getArg('--cdp-port',   '9222'));
+const SESSIONS_DIR    = path.resolve(getArg('--sessions', './coverage-sessions'));
+const REPORT_DIR      = path.resolve(getArg('--report',   './coverage-report'));
+const SRC_PREFIX      = getArg('--src-prefix', 'src/');
 
-// URL de l'app telle qu'elle est vue depuis la machine cible elle-même
-// (Chromium tourne sur la cible, donc localhost:8080 est correct pour lui)
-const APP_URL_LOCAL  = `http://localhost:${APP_PORT}`;
-
-// URL CDP : depuis la machine testeur, on pointe vers la cible
-const CDP_URL        = `http://${TARGET_HOST}:${CDP_PORT}`;
+const APP_URL         = `http://${TARGET}`;
+const CDP_URL         = `http://localhost:${CDP_PORT}`;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -88,7 +74,6 @@ function listSessions() {
       try { meta = JSON.parse(fs.readFileSync(fullPath, 'utf8'))._meta || {}; } catch {}
       return {
         id:       path.basename(f, '.json'),
-        filename: f,
         size:     stat.size,
         date:     stat.mtime.toISOString(),
         label:    meta.label    || '',
@@ -117,7 +102,51 @@ const v8toIstanbul          = (await import('v8-to-istanbul')).default;
 ensureDir(SESSIONS_DIR);
 ensureDir(REPORT_DIR);
 
-// ─── State ────────────────────────────────────────────────────────────────────
+// ─── Fetching bundles depuis Quarkus ─────────────────────────────────────────
+
+// Cache en mémoire pour éviter de re-télécharger à chaque rapport
+const bundleCache = new Map(); // bundleName → { js: string, map: object }
+
+async function fetchBundle(bundleName) {
+  if (bundleCache.has(bundleName)) return bundleCache.get(bundleName);
+
+  const jsUrl  = `${APP_URL}/${bundleName}`;
+  const mapUrl = `${APP_URL}/${bundleName}.map`;
+
+  const [jsRes, mapRes] = await Promise.all([
+    fetch(jsUrl),
+    fetch(mapUrl),
+  ]);
+
+  if (!jsRes.ok)  throw new Error(`Impossible de télécharger ${jsUrl} (${jsRes.status})`);
+  if (!mapRes.ok) throw new Error(`Impossible de télécharger ${mapUrl} (${mapRes.status})`);
+
+  const js  = await jsRes.text();
+  const map = await mapRes.json();
+
+  const bundle = { js, map };
+  bundleCache.set(bundleName, bundle);
+  ok(`Bundle téléchargé : ${bundleName} (${(js.length/1024).toFixed(0)} KB)`);
+  return bundle;
+}
+
+function clearBundleCache() {
+  bundleCache.clear();
+  log('Cache bundles vidé');
+}
+
+/**
+ * Récupère la liste de tous les fichiers sources depuis main.js.map
+ * (propriété sources[] du source map).
+ * Filtre sur SRC_PREFIX pour ne garder que le code applicatif.
+ */
+async function fetchAllSourcesFromMainMap() {
+  const { map } = await fetchBundle('main.js');
+  if (!map.sources) return [];
+  return map.sources.filter(s => s.includes(SRC_PREFIX));
+}
+
+// ─── CDP / Puppeteer ─────────────────────────────────────────────────────────
 
 let browser      = null;
 let page         = null;
@@ -125,35 +154,24 @@ let cdpSession   = null;
 let sessionStart = null;
 let isRecording  = false;
 
-// ─── CDP connection ───────────────────────────────────────────────────────────
-
 async function checkCdpReachable() {
-  // Vérifie que Chromium sur la cible est bien accessible
   try {
     const res = await fetch(`${CDP_URL}/json/version`, { signal: AbortSignal.timeout(2000) });
     return res.ok;
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
 async function connectCDP() {
   const puppeteer = await import('puppeteer-core');
-
   browser = await puppeteer.connect({
-    browserURL:      CDP_URL,   // ← pointe directement vers la machine cible
+    browserURL:      CDP_URL,
     defaultViewport: null,
   });
-
   const pages = await browser.pages();
   page = pages[0] || await browser.newPage();
-
-  // Si la page n'est pas sur l'app, on y navigue
-  // (localhost ici = localhost VU PAR CHROMIUM, donc la machine cible)
-  if (!page.url().startsWith(APP_URL_LOCAL)) {
-    await page.goto(APP_URL_LOCAL, { waitUntil: 'networkidle2' });
+  if (!page.url().startsWith(APP_URL)) {
+    await page.goto(APP_URL, { waitUntil: 'networkidle2' });
   }
-
   cdpSession = await page.createCDPSession();
   ok(`CDP connecté → ${CDP_URL}`);
 }
@@ -167,7 +185,7 @@ async function startPreciseCoverage() {
   });
   sessionStart = Date.now();
   isRecording  = true;
-  ok('Collecte précise démarrée (fonctions incluses)');
+  ok('Collecte précise démarrée');
 }
 
 async function stopAndCollect(label) {
@@ -179,45 +197,51 @@ async function stopAndCollect(label) {
   const duration = Date.now() - sessionStart;
   const id       = sessionId();
 
-  // On garde uniquement les bundles de l'app (filtre sur l'URL)
-  const appOrigin = `http://localhost:${APP_PORT}`;
-  const filtered  = result.filter(e =>
-    e.url && e.url.startsWith(appOrigin) && e.url.endsWith('.js')
+  // Ne garder que les bundles JS de l'app
+  const filtered = result.filter(e =>
+    e.url && e.url.startsWith(APP_URL) && e.url.endsWith('.js')
   );
 
-  const sessionData = {
-    _meta:  { id, label, duration, date: new Date().toISOString(), target: TARGET_HOST },
-    result: filtered,
-  };
+  fs.writeFileSync(
+    path.join(SESSIONS_DIR, `${id}.json`),
+    JSON.stringify({
+      _meta:  { id, label, duration, date: new Date().toISOString() },
+      result: filtered,
+    }, null, 2)
+  );
 
-  const outFile = path.join(SESSIONS_DIR, `${id}.json`);
-  fs.writeFileSync(outFile, JSON.stringify(sessionData, null, 2));
   ok(`Session sauvegardée : ${id}  (${filtered.length} bundle(s), ${(duration/1000).toFixed(0)}s)`);
   return { id, duration, bundleCount: filtered.length };
 }
 
-// ─── Report generation ───────────────────────────────────────────────────────
+// ─── Rapport ─────────────────────────────────────────────────────────────────
 
-function findAllTsFiles(dir) {
-  const results = [];
-  if (!fs.existsSync(dir)) return results;
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      results.push(...findAllTsFiles(full));
-    } else if (
-      entry.name.endsWith('.ts') &&
-      !entry.name.endsWith('.spec.ts') &&
-      !entry.name.endsWith('.d.ts')
-    ) {
-      results.push(full);
-    }
-  }
-  return results;
+/**
+ * Écrit un fichier JS temporaire sur disque + son .map
+ * pour que v8-to-istanbul puisse les lire (il a besoin de vrais fichiers).
+ * Retourne le chemin du fichier JS temporaire.
+ */
+async function writeTempBundle(tmpDir, bundleName, js, map) {
+  const jsPath  = path.join(tmpDir, bundleName);
+  const mapPath = jsPath + '.map';
+
+  // S'assurer que le JS pointe vers le bon .map (nom simple, pas d'URL)
+  const jsWithMap = js.replace(
+    /\/\/# sourceMappingURL=.*/,
+    `//# sourceMappingURL=${bundleName}.map`
+  );
+
+  fs.writeFileSync(jsPath,  jsWithMap);
+  fs.writeFileSync(mapPath, JSON.stringify(map));
+  return jsPath;
 }
 
-function buildZeroEntry(absPath, relKey) {
-  const lines        = fs.readFileSync(absPath, 'utf8').split('\n');
+/**
+ * Construit une entrée Istanbul à 0% pour un fichier source
+ * dont le contenu est dans sourcesContent du .map.
+ */
+function buildZeroEntry(sourceContent, relKey) {
+  const lines        = sourceContent.split('\n');
   const statementMap = {};
   const s            = {};
   let idx = 0;
@@ -234,74 +258,114 @@ function buildZeroEntry(absPath, relKey) {
 }
 
 async function generateReport(sessionIds) {
-  const nycOutput = path.join(REPORT_DIR, '.nyc_output');
-  ensureDir(nycOutput);
-  fs.readdirSync(nycOutput).forEach(f => fs.unlinkSync(path.join(nycOutput, f)));
+  // Vider le cache pour avoir les .map à jour
+  clearBundleCache();
 
+  const nycOutput = path.join(REPORT_DIR, '.nyc_output');
+  const tmpDir    = path.join(REPORT_DIR, '.tmp_bundles');
+  ensureDir(nycOutput);
+  ensureDir(tmpDir);
+
+  // Nettoyer les sorties précédentes
+  for (const d of [nycOutput, tmpDir]) {
+    fs.readdirSync(d).forEach(f => fs.unlinkSync(path.join(d, f)));
+  }
+
+  // Charger et fusionner les sessions
   const allSessions = sessionIds.map(id => {
     const raw = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, `${id}.json`), 'utf8'));
     return { result: raw.result };
   });
-
   const merged = allSessions.length === 1
     ? allSessions[0].result
     : mergeProcessCovs(allSessions).result;
 
-  const SRC_PREFIX   = path.relative(process.cwd(), SRC_DIR).replace(/\\/g, '/') + '/';
-  const coveredFiles = new Set();
+  // Récupérer la liste complète des sources depuis main.js.map
+  const allSources = await fetchAllSourcesFromMainMap();
+  log(`${allSources.length} fichiers sources référencés dans main.js.map`);
+
+  const coveredFiles = new Set(); // clés relatives ex: "src/app/foo.component.ts"
   let fileIdx = 0;
 
+  // Convertir chaque bundle
   for (const entry of merged) {
     if (!entry.url?.endsWith('.js')) continue;
 
     const bundleName = path.basename(new URL(entry.url).pathname);
-    const bundlePath = path.join(DIST_DIR, bundleName);
-    if (!fs.existsSync(bundlePath) || !fs.existsSync(bundlePath + '.map')) {
-      warn(`Bundle ou .map absent, ignoré : ${bundleName}`);
+
+    let bundle;
+    try {
+      bundle = await fetchBundle(bundleName);
+    } catch (err) {
+      warn(`Impossible de récupérer ${bundleName}: ${err.message}`);
       continue;
     }
 
+    // Écrire le bundle temporairement sur disque pour v8-to-istanbul
+    const tmpJsPath = await writeTempBundle(tmpDir, bundleName, bundle.js, bundle.map);
+
     try {
-      const converter = v8toIstanbul(bundlePath);
+      const converter = v8toIstanbul(tmpJsPath);
       await converter.load();
-      // entry.functions est au format natif V8 → colonnes Functions correctes ✅
+      // entry.functions = format V8 natif (Profiler.takePreciseCoverage) → fonctions OK ✅
       converter.applyCoverage(entry.functions || []);
       const data = converter.toIstanbul();
 
       for (const [filePath, fileData] of Object.entries(data)) {
         const norm = filePath.replace(/\\/g, '/');
         if (!norm.includes(SRC_PREFIX)) continue;
+
         const relKey  = norm.slice(norm.indexOf(SRC_PREFIX));
         fileData.path = relKey;
         coveredFiles.add(relKey);
+
         fs.writeFileSync(
           path.join(nycOutput, `bundle-${fileIdx++}.json`),
           JSON.stringify({ [relKey]: fileData }, null, 2)
         );
       }
+      ok(`Converti : ${bundleName}`);
     } catch (err) {
       warn(`Conversion échouée pour ${bundleName}: ${err.message}`);
+      if (process.env.DEBUG) console.error(err.stack);
     }
   }
 
-  // Fichiers jamais chargés → 0% sur toutes les colonnes
+  // Ajouter les fichiers jamais chargés à 0%
+  // Le contenu vient de sourcesContent dans main.js.map
+  const mainMap    = (await fetchBundle('main.js')).map;
+  const srcContent = mainMap.sourcesContent || [];
   let zeroCount = 0;
-  for (const absPath of findAllTsFiles(SRC_DIR)) {
-    const relKey = path.relative(process.cwd(), absPath).replace(/\\/g, '/');
+
+  for (let i = 0; i < allSources.length; i++) {
+    const rawPath = allSources[i];
+    const norm    = rawPath.replace(/\\/g, '/');
+    const relKey  = norm.includes(SRC_PREFIX)
+      ? norm.slice(norm.indexOf(SRC_PREFIX))
+      : norm;
+
     if (coveredFiles.has(relKey)) continue;
+
+    const content = srcContent[i] || '';
+    if (!content.trim()) continue; // fichier vide, on ignore
+
     fs.writeFileSync(
       path.join(nycOutput, `zero-${zeroCount++}.json`),
-      JSON.stringify({ [relKey]: buildZeroEntry(absPath, relKey) }, null, 2)
+      JSON.stringify({ [relKey]: buildZeroEntry(content, relKey) }, null, 2)
     );
   }
 
+  ok(`${coveredFiles.size} fichier(s) couverts, ${zeroCount} à 0%`);
+
+  // Générer le rapport HTML
   const nycBin = path.resolve(__dirname, 'node_modules/.bin/nyc');
   execSync(
-    `"${nycBin}" report --reporter=html --reporter=text-summary --report-dir="${REPORT_DIR}" --temp-dir="${nycOutput}"`,
+    `"${nycBin}" report --reporter=html --reporter=text-summary` +
+    ` --report-dir="${REPORT_DIR}" --temp-dir="${nycOutput}"`,
     { stdio: 'pipe', cwd: __dirname }
   );
 
-  ok(`Rapport généré : ${REPORT_DIR}/index.html`);
+  ok(`Rapport généré → ${REPORT_DIR}/index.html`);
   return { coveredFiles: coveredFiles.size, zeroFiles: zeroCount };
 }
 
@@ -319,31 +383,25 @@ function broadcast(data) {
   wss.clients.forEach(c => { if (c.readyState === 1) c.send(msg); });
 }
 
-// Push timer toutes les secondes
 setInterval(() => {
-  if (isRecording && sessionStart) {
+  if (isRecording && sessionStart)
     broadcast({ type: 'tick', elapsed: Date.now() - sessionStart });
-  }
 }, 1000);
 
 // ─── API ─────────────────────────────────────────────────────────────────────
 
 app.get('/api/status', async (req, res) => {
-  const cdpReachable = browser ? true : await checkCdpReachable();
   res.json({
     isRecording,
     elapsed:       sessionStart ? Date.now() - sessionStart : 0,
-    target:        TARGET_HOST,
+    appUrl:        APP_URL,
     cdpUrl:        CDP_URL,
-    appUrl:        `http://${TARGET_HOST}:${APP_PORT}`,
     chromiumReady: !!browser,
-    cdpReachable,
+    cdpReachable:  await checkCdpReachable(),
   });
 });
 
-app.get('/api/sessions', (_req, res) => {
-  res.json(listSessions());
-});
+app.get('/api/sessions', (_req, res) => res.json(listSessions()));
 
 app.delete('/api/sessions', (req, res) => {
   const { ids } = req.body;
@@ -360,24 +418,25 @@ app.post('/api/session/start', async (req, res) => {
 
     if (!await checkCdpReachable()) {
       return res.status(503).json({
-        error: `Chromium non accessible sur ${CDP_URL}.\n` +
-               `Lancez-le sur la machine cible avec :\n` +
-               `  chromium --remote-debugging-port=${CDP_PORT} --remote-debugging-address=0.0.0.0 --no-sandbox http://localhost:${APP_PORT}`
+        error:   `CDP non accessible sur ${CDP_URL}`,
+        hint:    `Ouvrez le tunnel SSH : ssh -L ${CDP_PORT}:localhost:${CDP_PORT} user@machineA`,
       });
     }
 
     if (!browser) {
       await connectCDP();
     } else {
-      // Nouvelle session : on recharge la page pour repartir d'un état propre
       try {
         await page.reload({ waitUntil: 'networkidle2' });
       } catch {
-        // Page perdue (ex: navigation manuelle), on reconnecte
         await connectCDP();
-        await page.goto(APP_URL_LOCAL, { waitUntil: 'networkidle2' });
+        await page.goto(APP_URL, { waitUntil: 'networkidle2' });
       }
     }
+
+    // On vide le cache bundles pour que chaque session parte
+    // avec les fichiers .js/.map effectivement servis à ce moment-là
+    clearBundleCache();
 
     await startPreciseCoverage();
     res.json({ ok: true, startedAt: sessionStart });
@@ -401,7 +460,8 @@ app.post('/api/session/stop', async (req, res) => {
 app.post('/api/report', async (req, res) => {
   try {
     const { sessionIds } = req.body;
-    if (!sessionIds?.length) return res.status(400).json({ error: 'Aucune session sélectionnée' });
+    if (!sessionIds?.length)
+      return res.status(400).json({ error: 'Aucune session sélectionnée' });
     const result = await generateReport(sessionIds);
     res.json({ ok: true, ...result });
   } catch (err) {
@@ -415,17 +475,10 @@ app.use('/report', express.static(REPORT_DIR));
 // ─── Start ───────────────────────────────────────────────────────────────────
 
 server.listen(CONTROLLER_PORT, '0.0.0.0', () => {
-  ok(`Controller démarré → http://0.0.0.0:${CONTROLLER_PORT}`);
-  log(`Machine cible    : ${TARGET_HOST}`);
-  log(`CDP cible        : ${CDP_URL}`);
-  log(`App cible        : http://${TARGET_HOST}:${APP_PORT}`);
-  log(`Sessions         : ${SESSIONS_DIR}`);
-  log(`Rapports         : ${REPORT_DIR}`);
-  log(`Dist (.map)      : ${DIST_DIR}`);
+  ok(`Panel → http://localhost:${CONTROLLER_PORT}`);
+  log(`App    : ${APP_URL}`);
+  log(`CDP    : ${CDP_URL}  (tunnel SSH requis)`);
   log('');
-  log('Prérequis sur la machine cible :');
-  log(`  chromium --remote-debugging-port=${CDP_PORT} \\`);
-  log(`           --remote-debugging-address=0.0.0.0 \\`);
-  log(`           --no-sandbox \\`);
-  log(`           http://localhost:${APP_PORT}`);
+  log('Avant de démarrer, ouvrez le tunnel SSH :');
+  log(`  ssh -L ${CDP_PORT}:localhost:${CDP_PORT} user@machineA`);
 });
