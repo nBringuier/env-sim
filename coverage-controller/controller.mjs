@@ -86,7 +86,10 @@ function listSessions() {
 // ─── Dependency check ────────────────────────────────────────────────────────
 
 log('Vérification des dépendances…');
-const NEEDED  = ['v8-to-istanbul', '@bcoe/v8-coverage', 'nyc'];
+const NEEDED  = [
+  'v8-to-istanbul', '@bcoe/v8-coverage',
+  'istanbul-lib-coverage', 'istanbul-lib-report', 'istanbul-reports',
+];
 const missing = NEEDED.filter(pkg => {
   try { require.resolve(pkg); return false; } catch { return true; }
 });
@@ -98,6 +101,9 @@ ok('Dépendances OK');
 
 const { mergeProcessCovs } = await import('@bcoe/v8-coverage');
 const v8toIstanbul          = (await import('v8-to-istanbul')).default;
+const libCoverage           = require('istanbul-lib-coverage');
+const libReport             = require('istanbul-lib-report');
+const istanbulReports       = require('istanbul-reports');
 
 ensureDir(SESSIONS_DIR);
 ensureDir(REPORT_DIR);
@@ -177,15 +183,24 @@ async function connectCDP() {
 }
 
 async function startPreciseCoverage() {
+  // IMPORTANT : activer le block coverage AVANT le reload de la page.
+  // Si on active après que les scripts sont déjà compilés par V8,
+  // isBlockCoverage restera false et les branches ne seront pas collectées.
   await cdpSession.send('Profiler.enable');
   await cdpSession.send('Profiler.startPreciseCoverage', {
     callCount:             true,
-    detailed:              true,
+    detailed:              true,   // ← active le block coverage (branches)
     allowTriggeredUpdates: false,
   });
+  ok('Collecte précise activée — rechargement de la page…');
+
+  // Recharger la page APRÈS avoir activé la collecte :
+  // V8 recompile les scripts avec le block coverage actif → isBlockCoverage: true
+  await page.reload({ waitUntil: 'networkidle2' });
+
   sessionStart = Date.now();
   isRecording  = true;
-  ok('Collecte précise démarrée');
+  ok('Page rechargée — collecte démarrée (branches incluses)');
 }
 
 async function stopAndCollect(label) {
@@ -217,28 +232,18 @@ async function stopAndCollect(label) {
 // ─── Rapport ─────────────────────────────────────────────────────────────────
 
 /**
- * Écrit un fichier JS temporaire sur disque + son .map
- * pour que v8-to-istanbul puisse les lire (il a besoin de vrais fichiers).
- * Retourne le chemin du fichier JS temporaire.
+ * Normalise une clé absolue produite par v8-to-istanbul vers une clé relative
+ * ex: /home/user/.../virtual/src/app/foo.ts → src/app/foo.ts
  */
-async function writeTempBundle(tmpDir, bundleName, js, map) {
-  const jsPath  = path.join(tmpDir, bundleName);
-  const mapPath = jsPath + '.map';
-
-  // S'assurer que le JS pointe vers le bon .map (nom simple, pas d'URL)
-  const jsWithMap = js.replace(
-    /\/\/# sourceMappingURL=.*/,
-    `//# sourceMappingURL=${bundleName}.map`
-  );
-
-  fs.writeFileSync(jsPath,  jsWithMap);
-  fs.writeFileSync(mapPath, JSON.stringify(map));
-  return jsPath;
+function normaliseKey(absKey) {
+  const norm = absKey.replace(/\\/g, '/');
+  const idx  = norm.indexOf(SRC_PREFIX);
+  return idx !== -1 ? norm.slice(idx) : null;
 }
 
 /**
- * Construit une entrée Istanbul à 0% pour un fichier source
- * dont le contenu est dans sourcesContent du .map.
+ * Construit une entrée Istanbul à 0% (fichier jamais chargé).
+ * Le contenu TypeScript vient de sourcesContent dans le .map.
  */
 function buildZeroEntry(sourceContent, relKey) {
   const lines        = sourceContent.split('\n');
@@ -258,20 +263,9 @@ function buildZeroEntry(sourceContent, relKey) {
 }
 
 async function generateReport(sessionIds) {
-  // Vider le cache pour avoir les .map à jour
   clearBundleCache();
 
-  const nycOutput = path.join(REPORT_DIR, '.nyc_output');
-  const tmpDir    = path.join(REPORT_DIR, '.tmp_bundles');
-  ensureDir(nycOutput);
-  ensureDir(tmpDir);
-
-  // Nettoyer les sorties précédentes
-  for (const d of [nycOutput, tmpDir]) {
-    fs.readdirSync(d).forEach(f => fs.unlinkSync(path.join(d, f)));
-  }
-
-  // Charger et fusionner les sessions
+  // ── 1. Charger et fusionner les sessions ───────────────────────────────────
   const allSessions = sessionIds.map(id => {
     const raw = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, `${id}.json`), 'utf8'));
     return { result: raw.result };
@@ -280,19 +274,31 @@ async function generateReport(sessionIds) {
     ? allSessions[0].result
     : mergeProcessCovs(allSessions).result;
 
-  // Récupérer la liste complète des sources depuis main.js.map
-  const allSources = await fetchAllSourcesFromMainMap();
+  // ── 2. Référentiel complet des sources depuis main.js.map ──────────────────
+  const mainBundle = await fetchBundle('main.js');
+  const mainMap    = mainBundle.map;
+  const allSources = (mainMap.sources || []).filter(s => s.includes(SRC_PREFIX));
   log(`${allSources.length} fichiers sources référencés dans main.js.map`);
 
-  const coveredFiles = new Set(); // clés relatives ex: "src/app/foo.component.ts"
-  let fileIdx = 0;
+  // Table relKey → contenu TypeScript (depuis sourcesContent)
+  // Indexé par la position dans sources[] pour correspondance exacte
+  const sourceContents = {}; // relKey → string
+  (mainMap.sourcesContent || []).forEach((content, i) => {
+    if (!mainMap.sources[i]) return;
+    const norm   = mainMap.sources[i].replace(/\\/g, '/');
+    const relKey = norm.includes(SRC_PREFIX) ? norm.slice(norm.indexOf(SRC_PREFIX)) : null;
+    if (relKey) sourceContents[relKey] = content || '';
+  });
 
-  // Convertir chaque bundle
+  // ── 3. Convertir chaque bundle en données Istanbul ─────────────────────────
+  // Tout se passe en mémoire : on passe source + sourceMap directement
+  // à v8-to-istanbul via l'option sources{} — pas de fichier temporaire.
+  const allIstanbulData = {}; // relKey → CoverageData (fusionné si plusieurs bundles)
+
   for (const entry of merged) {
     if (!entry.url?.endsWith('.js')) continue;
 
     const bundleName = path.basename(new URL(entry.url).pathname);
-
     let bundle;
     try {
       bundle = await fetchBundle(bundleName);
@@ -301,72 +307,73 @@ async function generateReport(sessionIds) {
       continue;
     }
 
-    // Écrire le bundle temporairement sur disque pour v8-to-istanbul
-    const tmpJsPath = await writeTempBundle(tmpDir, bundleName, bundle.js, bundle.map);
-
     try {
-      const converter = v8toIstanbul(tmpJsPath);
+      // On passe le JS et le sourceMap directement en mémoire :
+      // v8-to-istanbul utilisera sourcesContent depuis le map → pas de lecture disque
+      const converter = v8toIstanbul(
+        `virtual/${bundleName}`,  // chemin fictif — jamais lu depuis le disque
+        0,
+        {
+          source:    bundle.js,
+          sourceMap: { sourcemap: bundle.map },
+        }
+      );
       await converter.load();
-      // entry.functions = format V8 natif (Profiler.takePreciseCoverage) → fonctions OK ✅
       converter.applyCoverage(entry.functions || []);
       const data = converter.toIstanbul();
 
-      for (const [filePath, fileData] of Object.entries(data)) {
-        const norm = filePath.replace(/\\/g, '/');
-        if (!norm.includes(SRC_PREFIX)) continue;
-
-        const relKey  = norm.slice(norm.indexOf(SRC_PREFIX));
+      for (const [absKey, fileData] of Object.entries(data)) {
+        const relKey = normaliseKey(absKey);
+        if (!relKey) continue;
         fileData.path = relKey;
-        coveredFiles.add(relKey);
-
-        fs.writeFileSync(
-          path.join(nycOutput, `bundle-${fileIdx++}.json`),
-          JSON.stringify({ [relKey]: fileData }, null, 2)
-        );
+        allIstanbulData[relKey] = fileData;
       }
-      ok(`Converti : ${bundleName}`);
+      ok(`Converti : ${bundleName} (${Object.keys(data).length} entrées)`);
     } catch (err) {
       warn(`Conversion échouée pour ${bundleName}: ${err.message}`);
       if (process.env.DEBUG) console.error(err.stack);
     }
   }
 
-  // Ajouter les fichiers jamais chargés à 0%
-  // Le contenu vient de sourcesContent dans main.js.map
-  const mainMap    = (await fetchBundle('main.js')).map;
-  const srcContent = mainMap.sourcesContent || [];
+  // ── 4. Ajouter les fichiers jamais chargés à 0% ────────────────────────────
   let zeroCount = 0;
-
-  for (let i = 0; i < allSources.length; i++) {
-    const rawPath = allSources[i];
-    const norm    = rawPath.replace(/\\/g, '/');
-    const relKey  = norm.includes(SRC_PREFIX)
-      ? norm.slice(norm.indexOf(SRC_PREFIX))
-      : norm;
-
-    if (coveredFiles.has(relKey)) continue;
-
-    const content = srcContent[i] || '';
-    if (!content.trim()) continue; // fichier vide, on ignore
-
-    fs.writeFileSync(
-      path.join(nycOutput, `zero-${zeroCount++}.json`),
-      JSON.stringify({ [relKey]: buildZeroEntry(content, relKey) }, null, 2)
-    );
+  for (const rawPath of allSources) {
+    const norm   = rawPath.replace(/\\/g, '/');
+    const relKey = norm.includes(SRC_PREFIX) ? norm.slice(norm.indexOf(SRC_PREFIX)) : norm;
+    if (allIstanbulData[relKey]) continue;          // déjà couvert
+    const content = sourceContents[relKey] || '';
+    if (!content.trim()) continue;                  // fichier vide
+    allIstanbulData[relKey] = buildZeroEntry(content, relKey);
+    zeroCount++;
   }
 
-  ok(`${coveredFiles.size} fichier(s) couverts, ${zeroCount} à 0%`);
+  const coveredCount = Object.keys(allIstanbulData).length - zeroCount;
+  ok(`${coveredCount} fichier(s) couverts, ${zeroCount} à 0%`);
 
-  // Générer le rapport HTML
-  const nycBin = path.resolve(__dirname, 'node_modules/.bin/nyc');
-  execSync(
-    `"${nycBin}" report --reporter=html --reporter=text-summary` +
-    ` --report-dir="${REPORT_DIR}" --temp-dir="${nycOutput}"`,
-    { stdio: 'pipe', cwd: __dirname }
-  );
+  // ── 5. Générer le rapport HTML via l'API Istanbul directe ──────────────────
+  // sourceFinder : retourne le source TypeScript depuis notre cache en mémoire
+  // (évite toute lecture disque → résout l'erreur ENOENT)
+  ensureDir(REPORT_DIR);
+
+  const coverageMap = libCoverage.createCoverageMap(allIstanbulData);
+  const context = libReport.createContext({
+    dir: REPORT_DIR,
+    coverageMap,
+    sourceFinder: (relPath) => {
+      if (sourceContents[relPath] !== undefined) return sourceContents[relPath];
+      // Tentative de correspondance partielle (certains reporters normalisent le chemin)
+      const match = Object.keys(sourceContents).find(k => k.endsWith(relPath) || relPath.endsWith(k));
+      if (match) return sourceContents[match];
+      warn(`Source introuvable en mémoire : ${relPath}`);
+      return `// Source non disponible: ${relPath}`;
+    },
+  });
+
+  istanbulReports.create('html').execute(context);
+  istanbulReports.create('text-summary').execute(context);
 
   ok(`Rapport généré → ${REPORT_DIR}/index.html`);
-  return { coveredFiles: coveredFiles.size, zeroFiles: zeroCount };
+  return { coveredFiles: coveredCount, zeroFiles: zeroCount };
 }
 
 // ─── Express + WebSocket ─────────────────────────────────────────────────────
@@ -426,18 +433,20 @@ app.post('/api/session/start', async (req, res) => {
     if (!browser) {
       await connectCDP();
     } else {
+      // Vérifier que la session CDP est encore vivante
       try {
-        await page.reload({ waitUntil: 'networkidle2' });
+        await cdpSession.send('Runtime.enable');
       } catch {
+        // Session perdue (ex: navigation manuelle), on reconnecte
         await connectCDP();
-        await page.goto(APP_URL, { waitUntil: 'networkidle2' });
       }
     }
 
-    // On vide le cache bundles pour que chaque session parte
-    // avec les fichiers .js/.map effectivement servis à ce moment-là
+    // Vider le cache bundles — le reload qui suit va re-servir les fichiers
     clearBundleCache();
 
+    // startPreciseCoverage active la collecte PUIS recharge la page
+    // dans le bon ordre pour avoir isBlockCoverage: true (branches)
     await startPreciseCoverage();
     res.json({ ok: true, startedAt: sessionStart });
   } catch (err) {

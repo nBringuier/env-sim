@@ -1,2 +1,6 @@
 target/
 src/main/webui/coverage-report
+node_modules/
+coverage-report/
+coverage-sessions/
+/coverage-controller/package-lock.json
