@@ -371,9 +371,11 @@ async function generateReport(sessionIds) {
 
   istanbulReports.create('html').execute(context);
   istanbulReports.create('text-summary').execute(context);
+  // Export JSON brut pour le rapport d'exigences
+  istanbulReports.create('json').execute(context);
 
   ok(`Rapport généré → ${REPORT_DIR}/index.html`);
-  return { coveredFiles: coveredCount, zeroFiles: zeroCount };
+  return { coveredFiles: coveredCount, zeroFiles: zeroCount, sourceContents, allIstanbulData };
 }
 
 // ─── Express + WebSocket ─────────────────────────────────────────────────────
@@ -472,6 +474,21 @@ app.post('/api/report', async (req, res) => {
     if (!sessionIds?.length)
       return res.status(400).json({ error: 'Aucune session sélectionnée' });
     const result = await generateReport(sessionIds);
+
+    // Générer les CSV d'exigences si le module est disponible
+    try {
+      const { generateRequirementCsv } = await import('./requirement-coverage.mjs');
+      const csvResult = await generateRequirementCsv({
+        sourceContents:  result.sourceContents,
+        allIstanbulData: result.allIstanbulData,
+        reportDir:       REPORT_DIR,
+      });
+      result.csvFiles = csvResult;
+      ok(`CSV exigences → ${csvResult.details}, ${csvResult.summary}`);
+    } catch (err) {
+      warn(`CSV exigences non généré : ${err.message} (requirement-coverage.mjs absent ?)`);
+    }
+
     res.json({ ok: true, ...result });
   } catch (err) {
     warn(err.message);
