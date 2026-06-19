@@ -7,13 +7,28 @@
  *   requirement-details.csv  — une ligne par (exigence × élément annoté)
  *   requirement-summary.csv  — une ligne par exigence avec % de couverture global
  *
- * Convention d'annotation :
- *   TypeScript/JS : // @requirement REQ-001 REQ-002
- *   HTML          : <!-- @requirement REQ-001 REQ-002 -->
+ * Formats d'annotation supportés :
  *
- * L'annotation s'applique à l'élément qui commence sur la ligne suivante.
- * Une annotation peut lister plusieurs IDs séparés par des espaces.
- * La même fonction/bloc peut être annotée plusieurs fois (plusieurs exigences).
+ *   // @requirement REQ-001
+ *   // @requirement REQ-001 REQ-002
+ *   function foo() { ... }
+ *
+ *   /**
+ *    * @requirement REQ-001
+ *    * @requirement REQ-002 texte descriptif ignoré
+ *    *\/
+ *   function bar() { ... }
+ *
+ *   <!-- @requirement REQ-001 texte ignoré -->
+ *   <!-- @requirement REQ-002 -->
+ *   <div>...</div>
+ *
+ * Règles :
+ *   - Le texte après l'ID (ou les IDs) est ignoré
+ *   - Plusieurs annotations consécutives (JSDoc ou HTML) se cumulent
+ *     sur l'élément qui suit le bloc
+ *   - Une annotation peut lister plusieurs IDs séparés par des espaces
+ *   - La même fonction/bloc peut répondre à plusieurs exigences (many-to-many)
  */
 
 import fs   from 'node:fs';
@@ -21,41 +36,138 @@ import path from 'node:path';
 
 // ─── Regex d'extraction ───────────────────────────────────────────────────────
 
-// Matche : // @requirement REQ-001 REQ-002
-//          /* @requirement REQ-001 */
-//          <!-- @requirement REQ-001 REQ-002 -->
-const ANNOTATION_RE = /(?:\/\/|\/\*|<!--)\s*@requirement\s+([\w\s\-]+?)(?:\*\/|-->|$)/;
+// Matche UNE occurrence de @requirement sur une ligne quelconque :
+//   // @requirement REQ-001 REQ-002 texte libre
+//    * @requirement REQ-001 texte libre          (ligne JSDoc)
+//   <!-- @requirement REQ-001 texte libre -->
+// Capture group 1 = tout ce qui suit @requirement jusqu'à */ --> ou fin de ligne
+const ANNOTATION_LINE_RE = /(?:\/\/|\/\*|\*|<!--)\s*@requirement\s+(.+?)(?:\*\/|-->|\*\s*$|$)/;
+
+// Un ID de requirement : majuscules, chiffres, tirets uniquement — ex: REQ-001, US-42, FEAT-A1
+const REQ_ID_PATTERN = /^[A-Z0-9][A-Z0-9\-]*$/;
+
+/**
+ * Extrait le ou les IDs depuis la partie capturée après @requirement.
+ * Format : "REQ-001 REQ-002 texte descriptif ignoré"
+ * → ['REQ-001', 'REQ-002']
+ *
+ * Règle : on consomme les tokens qui matchent [A-Z0-9-]+
+ * et on s'arrête dès qu'un token ne matche pas (= début du texte libre).
+ */
+function parseRequirementIds(raw) {
+  const tokens = raw.trim().split(/\s+/).filter(Boolean);
+  const ids    = [];
+  for (const token of tokens) {
+    if (REQ_ID_PATTERN.test(token)) ids.push(token);
+    else break; // premier token non-ID = texte descriptif, on arrête
+  }
+  return ids;
+}
 
 // ─── Parser d'annotations ─────────────────────────────────────────────────────
 
 /**
  * Extrait toutes les annotations @requirement d'un fichier source.
- * Retourne un tableau de { lineNumber, requirementIds, elementLine }
- * où elementLine = ligne de l'élément annoté (lineNumber + 1).
+ *
+ * Gère trois cas :
+ *   1. Annotation inline unique  : // @requirement REQ-001
+ *   2. Bloc JSDoc multi-lignes   : plusieurs @requirement dans /** ... *\/
+ *   3. Annotations HTML consécutives : plusieurs <!-- @requirement --> de suite
+ *
+ * Dans tous les cas, toutes les exigences trouvées dans un bloc contigu
+ * sont groupées et associées à l'élément qui commence après le bloc.
+ *
+ * Retourne [{ annotationLines: [n, ...], elementLine: n, requirementIds: [...] }]
  */
 function extractAnnotations(sourceContent) {
-  const lines       = sourceContent.split('\n');
-  const annotations = [];
+  const lines  = sourceContent.split('\n');
+  const result = [];
 
-  lines.forEach((line, idx) => {
-    const match = ANNOTATION_RE.exec(line);
-    if (!match) return;
+  let i = 0;
+  while (i < lines.length) {
+    const line    = lines[i];
+    const trimmed = line.trim();
 
-    const ids = match[1]
-      .trim()
-      .split(/\s+/)
-      .filter(id => id.length > 0);
+    // ── Cas 1 : début d'un bloc JSDoc /** ─────────────────────────────────
+    if (trimmed.startsWith('/**')) {
+      const blockStart = i;
+      const ids        = [];
+      const annLines   = [i + 1];
 
-    if (!ids.length) return;
+      // Chercher @requirement dans le bloc jusqu'à */
+      let j = i;
+      while (j < lines.length) {
+        const m = ANNOTATION_LINE_RE.exec(lines[j]);
+        if (m) {
+          const extracted = parseRequirementIds(m[1]);
+          ids.push(...extracted);
+          if (j !== i) annLines.push(j + 1);
+        }
+        if (lines[j].trim().includes('*/') && j > i) {
+          i = j; // avancer jusqu'à la fermeture du bloc
+          break;
+        }
+        j++;
+      }
 
-    annotations.push({
-      annotationLine: idx + 1,          // 1-based
-      elementLine:    idx + 2,          // ligne de l'élément qui suit
-      requirementIds: ids,
-    });
-  });
+      if (ids.length) {
+        result.push({
+          annotationLines: annLines,
+          elementLine:     i + 2, // ligne après */
+          requirementIds:  [...new Set(ids)],
+        });
+      }
+      i++;
+      continue;
+    }
 
-  return annotations;
+    // ── Cas 2 : annotation(s) HTML consécutives <!-- @requirement --> ──────
+    if (trimmed.startsWith('<!--') && ANNOTATION_LINE_RE.test(trimmed)) {
+      const ids      = [];
+      const annLines = [];
+
+      // Consommer toutes les lignes <!-- @requirement --> consécutives
+      while (i < lines.length) {
+        const t = lines[i].trim();
+        if (!t.startsWith('<!--')) break;
+        const m = ANNOTATION_LINE_RE.exec(lines[i]);
+        if (!m) break; // commentaire HTML mais pas @requirement → stop
+        const extracted = parseRequirementIds(m[1]);
+        if (!extracted.length) break;
+        ids.push(...extracted);
+        annLines.push(i + 1);
+        i++;
+      }
+
+      if (ids.length) {
+        result.push({
+          annotationLines: annLines,
+          elementLine:     i + 1, // ligne après le dernier commentaire
+          requirementIds:  [...new Set(ids)],
+        });
+      }
+      continue; // i a déjà été incrémenté dans la boucle interne
+    }
+
+    // ── Cas 3 : annotation inline // @requirement ──────────────────────────
+    if (trimmed.startsWith('//') || trimmed.startsWith('*')) {
+      const m = ANNOTATION_LINE_RE.exec(line);
+      if (m) {
+        const ids = parseRequirementIds(m[1]);
+        if (ids.length) {
+          result.push({
+            annotationLines: [i + 1],
+            elementLine:     i + 2,
+            requirementIds:  ids,
+          });
+        }
+      }
+    }
+
+    i++;
+  }
+
+  return result;
 }
 
 // ─── Résolution de la couverture pour une ligne ───────────────────────────────
