@@ -13,12 +13,14 @@
  *   node controller.mjs [options]
  *
  * Options:
- *   --port        Port du panel de contrôle        (défaut: 9223)
- *   --target      Host:port de l'app Quarkus        (défaut: localhost:8080)
- *   --cdp-port    Port CDP (bout local du tunnel)   (défaut: 9222)
- *   --sessions    Dossier sessions                  (défaut: ./coverage-sessions)
- *   --report      Dossier rapport HTML              (défaut: ./coverage-report)
- *   --src-prefix  Préfixe des sources à inclure     (défaut: src/)
+ *   --port              Port du panel de contrôle        (défaut: 9223)
+ *   --target            Host:port de l'app Quarkus        (défaut: localhost:8080)
+ *   --cdp-port          Port CDP (bout local du tunnel)   (défaut: 9222)
+ *   --sessions          Dossier sessions                  (défaut: ./coverage-sessions)
+ *   --report            Dossier rapport HTML              (défaut: ./coverage-report)
+ *   --include-prefixes  Préfixes des sources à inclure,   (défaut: src/)
+ *                        séparés par des virgules.
+ *                        Ex: "src/,node_modules/ma-lib-maison/"
  */
 
 import express           from 'express';
@@ -46,7 +48,15 @@ const TARGET          = getArg('--target',    'localhost:8080');
 const CDP_PORT        = parseInt(getArg('--cdp-port',   '9222'));
 const SESSIONS_DIR    = path.resolve(getArg('--sessions', './coverage-sessions'));
 const REPORT_DIR      = path.resolve(getArg('--report',   './coverage-report'));
-const SRC_PREFIX      = getArg('--src-prefix', 'src/');
+
+// Liste des préfixes de chemins à inclure dans le rapport.
+// Un fichier référencé dans les .map est retenu si son chemin contient
+// AU MOINS UN de ces préfixes. Permet d'inclure des libs maison
+// situées dans node_modules/ en plus du code applicatif dans src/.
+const INCLUDE_PREFIXES = getArg('--include-prefixes', 'src/')
+  .split(',')
+  .map(p => p.trim())
+  .filter(Boolean);
 
 const APP_URL         = `http://${TARGET}`;
 const CDP_URL         = `http://localhost:${CDP_PORT}`;
@@ -61,6 +71,28 @@ function ensureDir(p) { fs.mkdirSync(p, { recursive: true }); }
 
 function sessionId() {
   return new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+}
+
+/**
+ * Teste si un chemin normalisé (slashes uniquement) contient
+ * au moins un des préfixes d'inclusion configurés.
+ */
+function isIncluded(normalisedPath) {
+  return INCLUDE_PREFIXES.some(prefix => normalisedPath.includes(prefix));
+}
+
+/**
+ * Retourne la clé relative à partir du premier préfixe d'inclusion trouvé.
+ * Ex: "/home/x/node_modules/ma-lib/foo.ts" avec prefix "node_modules/ma-lib/"
+ *     → "node_modules/ma-lib/foo.ts"
+ * Retourne null si aucun préfixe ne matche.
+ */
+function relativeKeyFor(normalisedPath) {
+  for (const prefix of INCLUDE_PREFIXES) {
+    const idx = normalisedPath.indexOf(prefix);
+    if (idx !== -1) return normalisedPath.slice(idx);
+  }
+  return null;
 }
 
 function listSessions() {
@@ -108,6 +140,8 @@ const istanbulReports       = require('istanbul-reports');
 ensureDir(SESSIONS_DIR);
 ensureDir(REPORT_DIR);
 
+log(`Préfixes inclus : ${INCLUDE_PREFIXES.join(', ')}`);
+
 // ─── Fetching bundles depuis Quarkus ─────────────────────────────────────────
 
 // Cache en mémoire pour éviter de re-télécharger à chaque rapport
@@ -144,12 +178,13 @@ function clearBundleCache() {
 /**
  * Récupère la liste de tous les fichiers sources depuis main.js.map
  * (propriété sources[] du source map).
- * Filtre sur SRC_PREFIX pour ne garder que le code applicatif.
+ * Filtre sur INCLUDE_PREFIXES pour ne garder que le code applicatif
+ * (+ les libs maison explicitement incluses).
  */
 async function fetchAllSourcesFromMainMap() {
   const { map } = await fetchBundle('main.js');
   if (!map.sources) return [];
-  return map.sources.filter(s => s.includes(SRC_PREFIX));
+  return map.sources.filter(s => isIncluded(s.replace(/\\/g, '/')));
 }
 
 // ─── CDP / Puppeteer ─────────────────────────────────────────────────────────
@@ -234,11 +269,11 @@ async function stopAndCollect(label) {
 /**
  * Normalise une clé absolue produite par v8-to-istanbul vers une clé relative
  * ex: /home/user/.../virtual/src/app/foo.ts → src/app/foo.ts
+ * ex: /home/user/.../virtual/node_modules/ma-lib/foo.ts → node_modules/ma-lib/foo.ts
  */
 function normaliseKey(absKey) {
   const norm = absKey.replace(/\\/g, '/');
-  const idx  = norm.indexOf(SRC_PREFIX);
-  return idx !== -1 ? norm.slice(idx) : null;
+  return relativeKeyFor(norm);
 }
 
 /**
@@ -277,8 +312,8 @@ async function generateReport(sessionIds) {
   // ── 2. Référentiel complet des sources depuis main.js.map ──────────────────
   const mainBundle = await fetchBundle('main.js');
   const mainMap    = mainBundle.map;
-  const allSources = (mainMap.sources || []).filter(s => s.includes(SRC_PREFIX));
-  log(`${allSources.length} fichiers sources référencés dans main.js.map`);
+  const allSources = (mainMap.sources || []).filter(s => isIncluded(s.replace(/\\/g, '/')));
+  log(`${allSources.length} fichiers sources référencés dans main.js.map (préfixes: ${INCLUDE_PREFIXES.join(', ')})`);
 
   // Table relKey → contenu TypeScript (depuis sourcesContent)
   // Indexé par la position dans sources[] pour correspondance exacte
@@ -286,7 +321,7 @@ async function generateReport(sessionIds) {
   (mainMap.sourcesContent || []).forEach((content, i) => {
     if (!mainMap.sources[i]) return;
     const norm   = mainMap.sources[i].replace(/\\/g, '/');
-    const relKey = norm.includes(SRC_PREFIX) ? norm.slice(norm.indexOf(SRC_PREFIX)) : null;
+    const relKey = relativeKeyFor(norm);
     if (relKey) sourceContents[relKey] = content || '';
   });
 
@@ -339,7 +374,7 @@ async function generateReport(sessionIds) {
   let zeroCount = 0;
   for (const rawPath of allSources) {
     const norm   = rawPath.replace(/\\/g, '/');
-    const relKey = norm.includes(SRC_PREFIX) ? norm.slice(norm.indexOf(SRC_PREFIX)) : norm;
+    const relKey = relativeKeyFor(norm) || norm;
     if (allIstanbulData[relKey]) continue;          // déjà couvert
     const content = sourceContents[relKey] || '';
     if (!content.trim()) continue;                  // fichier vide
