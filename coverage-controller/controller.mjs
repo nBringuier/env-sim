@@ -208,11 +208,24 @@ async function connectCDP() {
     browserURL:      CDP_URL,
     defaultViewport: null,
   });
+
   const pages = await browser.pages();
-  page = pages[0] || await browser.newPage();
-  if (!page.url().startsWith(APP_URL)) {
+
+  // Chercher parmi tous les onglets ouverts celui qui pointe déjà sur l'app.
+  // Évite de piloter par erreur un onglet quelconque (about:blank, devtools,
+  // ou toute autre page ouverte par le testeur en parallèle).
+  page = pages.find(p => p.url().startsWith(APP_URL)) || null;
+
+  if (!page) {
+    // Aucun onglet sur l'app : réutiliser un onglet vierge s'il y en a un,
+    // sinon en créer un nouveau, puis y naviguer.
+    page = pages.find(p => p.url() === 'about:blank') || await browser.newPage();
     await page.goto(APP_URL, { waitUntil: 'networkidle2' });
+    log(`Aucun onglet sur ${APP_URL} trouvé — navigation effectuée sur un onglet dédié`);
+  } else {
+    log(`Onglet existant sur ${APP_URL} réutilisé`);
   }
+
   cdpSession = await page.createCDPSession();
   ok(`CDP connecté → ${CDP_URL}`);
 }
