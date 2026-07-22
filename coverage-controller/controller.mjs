@@ -8,6 +8,8 @@
  * - Télécharge les .js et .js.map depuis Quarkus (machine A :8080)
  *   les .map contiennent sourcesContent → pas besoin de src/ en local
  * - Génère un rapport HTML Istanbul avec couverture par fonction
+ * - En parallèle (si --java-repo fourni), pilote la couverture backend
+ *   Java via un agent JaCoCo en mode tcpserver (module jacoco-coverage.mjs)
  *
  * Usage:
  *   node controller.mjs [options]
@@ -21,6 +23,14 @@
  *   --include-prefixes  Préfixes des sources à inclure,   (défaut: src/)
  *                        séparés par des virgules.
  *                        Ex: "src/,node_modules/ma-lib-maison/"
+ *
+ *   --java-repo         Clone git local du projet Java.   (optionnel — active JaCoCo
+ *                        Doit être tenu à jour (git pull   si fourni)
+ *                        + mvn compile) par le testeur.
+ *   --jacoco-cli        Chemin vers jacococli.jar.         (optionnel — auto-téléchargé
+ *                                                            depuis Maven Central sinon)
+ *   --jacoco-host       Host de l'agent JaCoCo tcpserver.  (défaut: localhost)
+ *   --jacoco-port       Port de l'agent JaCoCo tcpserver.  (défaut: 6300)
  */
 
 import express           from 'express';
@@ -49,7 +59,7 @@ const CDP_PORT        = parseInt(getArg('--cdp-port',   '9222'));
 const SESSIONS_DIR    = path.resolve(getArg('--sessions', './coverage-sessions'));
 const REPORT_DIR      = path.resolve(getArg('--report',   './coverage-report'));
 
-// Liste des préfixes de chemins à inclure dans le rapport.
+// Liste des préfixes de chemins à inclure dans le rapport front.
 // Un fichier référencé dans les .map est retenu si son chemin contient
 // AU MOINS UN de ces préfixes. Permet d'inclure des libs maison
 // situées dans node_modules/ en plus du code applicatif dans src/.
@@ -57,6 +67,13 @@ const INCLUDE_PREFIXES = getArg('--include-prefixes', 'src/')
   .split(',')
   .map(p => p.trim())
   .filter(Boolean);
+
+// ── JaCoCo (backend Java) — tout est optionnel, désactivé si --java-repo absent ──
+const JAVA_REPO_DIR  = getArg('--java-repo',   null);
+const JACOCO_CLI_JAR = getArg('--jacoco-cli',  null); // optionnel — auto-téléchargé sinon
+const JACOCO_HOST    = getArg('--jacoco-host', 'localhost');
+const JACOCO_PORT    = parseInt(getArg('--jacoco-port', '6300'));
+const JACOCO_ENABLED = !!JAVA_REPO_DIR;
 
 const APP_URL         = `http://${TARGET}`;
 const CDP_URL         = `http://localhost:${CDP_PORT}`;
@@ -140,7 +157,24 @@ const istanbulReports       = require('istanbul-reports');
 ensureDir(SESSIONS_DIR);
 ensureDir(REPORT_DIR);
 
-log(`Préfixes inclus : ${INCLUDE_PREFIXES.join(', ')}`);
+log(`Préfixes inclus (front) : ${INCLUDE_PREFIXES.join(', ')}`);
+
+// ── Module JaCoCo optionnel — n'importe rien si --java-repo absent ──────────
+let jacocoModule = null;
+if (JACOCO_ENABLED) {
+  jacocoModule = await import('./jacoco-coverage.mjs');
+  jacocoModule.configureJacoco({
+    jacocoCliJar: JACOCO_CLI_JAR,
+    javaRepoDir:  JAVA_REPO_DIR,
+    jacocoHost:   JACOCO_HOST,
+    jacocoPort:   JACOCO_PORT,
+    sessionsDir:  SESSIONS_DIR,
+    reportDir:    REPORT_DIR,
+  });
+  ok(`JaCoCo activé — repo: ${JAVA_REPO_DIR}, agent: ${JACOCO_HOST}:${JACOCO_PORT}`);
+} else {
+  log("JaCoCo désactivé (--java-repo requis pour l'activer)");
+}
 
 // ─── Fetching bundles depuis Quarkus ─────────────────────────────────────────
 
@@ -455,6 +489,7 @@ app.get('/api/status', async (req, res) => {
     cdpUrl:        CDP_URL,
     chromiumReady: !!browser,
     cdpReachable:  await checkCdpReachable(),
+    jacocoEnabled: JACOCO_ENABLED,
   });
 });
 
@@ -465,6 +500,9 @@ app.delete('/api/sessions', (req, res) => {
   for (const id of ids) {
     const f = path.join(SESSIONS_DIR, `${id}.json`);
     if (fs.existsSync(f)) fs.unlinkSync(f);
+    // Nettoyer aussi le .exec backend associé, s'il existe
+    const execF = path.join(SESSIONS_DIR, `${id}-backend.exec`);
+    if (fs.existsSync(execF)) fs.unlinkSync(execF);
   }
   res.json({ deleted: ids });
 });
@@ -495,10 +533,21 @@ app.post('/api/session/start', async (req, res) => {
     // Vider le cache bundles — le reload qui suit va re-servir les fichiers
     clearBundleCache();
 
+    // Démarrer la collecte backend en parallèle du front (si configuré).
+    // On le fait AVANT startPreciseCoverage pour que les deux collectes
+    // démarrent au plus proche l'une de l'autre.
+    if (jacocoModule) {
+      try {
+        await jacocoModule.startJacocoSession();
+      } catch (err) {
+        warn(`JaCoCo start ignoré : ${err.message}`);
+      }
+    }
+
     // startPreciseCoverage active la collecte PUIS recharge la page
     // dans le bon ordre pour avoir isBlockCoverage: true (branches)
     await startPreciseCoverage();
-    res.json({ ok: true, startedAt: sessionStart });
+    res.json({ ok: true, startedAt: sessionStart, jacocoEnabled: JACOCO_ENABLED });
   } catch (err) {
     warn(err.message);
     res.status(500).json({ error: err.message });
@@ -508,7 +557,20 @@ app.post('/api/session/start', async (req, res) => {
 app.post('/api/session/stop', async (req, res) => {
   try {
     if (!isRecording) return res.status(400).json({ error: 'Aucune session en cours' });
+
     const result = await stopAndCollect(req.body.label || '');
+
+    // Arrêter la collecte backend en parallèle (si configuré), même id de session
+    if (jacocoModule) {
+      try {
+        const backendResult = await jacocoModule.stopJacocoSession(result.id);
+        result.backend = backendResult;
+      } catch (err) {
+        warn(`JaCoCo stop ignoré : ${err.message}`);
+        result.backend = { ok: false, reason: err.message };
+      }
+    }
+
     res.json({ ok: true, ...result });
   } catch (err) {
     warn(err.message);
@@ -537,6 +599,18 @@ app.post('/api/report', async (req, res) => {
       warn(`CSV exigences non généré : ${err.message} (requirement-coverage.mjs absent ?)`);
     }
 
+    // Générer le rapport backend JaCoCo en parallèle (si configuré)
+    if (jacocoModule) {
+      try {
+        const backendReport = await jacocoModule.generateJacocoReport(sessionIds);
+        result.backendReport = backendReport;
+        if (backendReport.ok) ok(`Rapport backend → ${backendReport.reportDir}/index.html`);
+      } catch (err) {
+        warn(`Rapport JaCoCo non généré : ${err.message}`);
+        result.backendReport = { ok: false, reason: err.message };
+      }
+    }
+
     res.json({ ok: true, ...result });
   } catch (err) {
     warn(err.message);
@@ -545,6 +619,7 @@ app.post('/api/report', async (req, res) => {
 });
 
 app.use('/report', express.static(REPORT_DIR));
+app.use('/report/jacoco', express.static(path.join(REPORT_DIR, 'jacoco')));
 
 // ─── Start ───────────────────────────────────────────────────────────────────
 
@@ -552,7 +627,13 @@ server.listen(CONTROLLER_PORT, '0.0.0.0', () => {
   ok(`Panel → http://localhost:${CONTROLLER_PORT}`);
   log(`App    : ${APP_URL}`);
   log(`CDP    : ${CDP_URL}  (tunnel SSH requis)`);
+  if (JACOCO_ENABLED) {
+    log(`JaCoCo : ${JACOCO_HOST}:${JACOCO_PORT}  (repo: ${JAVA_REPO_DIR})`);
+  }
   log('');
   log('Avant de démarrer, ouvrez le tunnel SSH :');
   log(`  ssh -L ${CDP_PORT}:localhost:${CDP_PORT} user@machineA`);
+  if (JACOCO_ENABLED) {
+    log(`  ssh -L ${JACOCO_PORT}:localhost:${JACOCO_PORT} user@machineA   (peut être ajouté au même tunnel avec -L supplémentaire)`);
+  }
 });
